@@ -1,7 +1,7 @@
 ## 1. Setup
 
-- [ ] 1.1 Install Rust (`winget install Rustlang.Rustup`), confirm MSVC linker, verify `cargo --version`
-- [ ] 1.2 `cargo init --name screen-shifter`, add `windows` crate with needed features, add `.gitignore` for `target/`
+- [x] 1.1 Install Rust (`winget install Rustlang.Rustup`), confirm MSVC linker, verify `cargo --version`
+- [x] 1.2 `cargo init --name screen-shifter`, add `windows` crate with needed features, add `.gitignore` for `target/`
 - [ ] 1.3 `#![windows_subsystem = "windows"]` for release builds only, so debug builds keep a console for logging
 - [ ] 1.4 First lines of `main`: `SetProcessDpiAwarenessContext(PER_MONITOR_AWARE_V2)`; verify with a debug print of a window rect on each monitor
 
@@ -13,12 +13,12 @@
 
 ## 3. Pure core (`src/core.rs`)
 
-- [ ] 3.1 Define `const SLOTS`, `Entry { id, pid, iconic, class }`, `State` (monitor name → active index + slots of `Entry`), `Dir`, `Plan { hide, show }`
-- [ ] 3.2 Implement `switch(state, monitor, dir, visible_topmost_first, now_ms) -> Plan`: snapshot correction from the last plan if < 1 s old (design §6), snapshot-on-switch, clamping, and removing captured ids from every other slot
-- [ ] 3.3 Implement `restore_all(state) -> Vec<Entry>` (returns all hidden entries, resets every monitor to slot 1, clears every last plan) and `reset_if_monitors_changed(state, names) -> Option<Vec<Entry>>`
-- [ ] 3.4 Unit tests: monitor independence, clamp at both ends, round-trip order, new window joins current slot, dragged window stays on its monitor, empty slot, unknown monitor initialised on first use, window re-shown on other monitor is in only one slot, rapid Right×3/Left×3 with a stale snapshot restores the original slot exactly, a switch > 1 s later trusts the raw snapshot, a switch right after `restore_all` applies no stale correction, `restore_all`, monitor-set change vs unchanged
-- [ ] 3.5 Property-style test: over a random sequence of switches, every `show` id was previously hidden, no id is in two slots, and every id ever hidden is either in some slot or in `restore_all`'s output (never-lose-a-window)
-- [ ] 3.6 State file format: `serialize` / `parse` (`v1` header, `hwnd pid iconic class`, bad version or lines → skipped and reported) and `should_restore(entry, live_pid, live_class)`; round-trip and malformed-input tests
+- [x] 3.1 Define `const SLOTS`, `Entry { id, pid, iconic, class }`, `State` (monitor name → active index + slots of `Entry`), `Dir`, `Plan { hide, show }`
+- [x] 3.2 Implement `switch(state, monitor, dir, visible_topmost_first, now_ms) -> Plan`: snapshot correction from the last plan if < 1 s old (design §6), snapshot-on-switch, clamping, and removing captured ids from every other slot
+- [x] 3.3 Implement `restore_all(state) -> Vec<Entry>` (returns all hidden entries, resets every monitor to slot 1, clears every last plan) and `reset_if_monitors_changed(state, names) -> Option<Vec<Entry>>`
+- [x] 3.4 Unit tests: monitor independence, clamp at both ends, round-trip order, new window joins current slot, dragged window stays on its monitor, empty slot, unknown monitor initialised on first use, window re-shown on other monitor is in only one slot, rapid Right×3/Left×3 with a stale snapshot restores the original slot exactly, a switch > 1 s later trusts the raw snapshot, a switch right after `restore_all` applies no stale correction, `restore_all`, monitor-set change vs unchanged
+- [x] 3.5 Property-style test: over a random sequence of switches, every `show` id was previously hidden, no id is in two slots, and every id ever hidden is either in some slot or in `restore_all`'s output (never-lose-a-window)
+- [x] 3.6 State file format: `serialize` / `parse` (`v1` header, `hwnd pid iconic class`, bad version or lines → skipped and reported) and `should_restore(entry, live_pid, live_class)`; round-trip and malformed-input tests
 
 ## 4. Win32 shell (`src/win.rs`)
 
