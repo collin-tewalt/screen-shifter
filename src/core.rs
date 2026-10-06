@@ -55,13 +55,13 @@ impl State {
             return Plan::default();
         };
 
-        if let Some((last, at)) = &m.last {
-            if now_ms.saturating_sub(*at) < RACE_WINDOW_MS {
-                visible.retain(|v| !contains(&last.hide, v.id));
-                for e in &last.show {
-                    if !contains(&visible, e.id) {
-                        visible.push(e.clone());
-                    }
+        if let Some((last, at)) = &m.last
+            && now_ms.saturating_sub(*at) < RACE_WINDOW_MS
+        {
+            visible.retain(|v| !contains(&last.hide, v.id));
+            for e in &last.show {
+                if !contains(&visible, e.id) {
+                    visible.push(e.clone());
                 }
             }
         }

@@ -38,7 +38,7 @@ When leaving a slot, the windows currently visible on that monitor *are* that sl
 ### 3. Hide/show mechanics
 - Hide with `ShowWindowAsync(SW_HIDE)`: removes from the taskbar and Alt+Tab, and never blocks on a hung app. Windows where `IsHungAppWindow` is true are skipped (left visible).
 - **No post-hide visibility check.** `ShowWindowAsync` only posts to the target thread, so `IsWindowVisible` immediately afterwards is still true for nearly every cross-process window; checking it would drop real windows from the record and lose them. Every planned window stays recorded as hidden. A window that truly can't be hidden (elevated, UIPI) just stays visible; showing it later is a no-op, and the next snapshot of its monitor moves it into that slot via the one-slot invariant.
-- Show with `ShowWindowAsync(SW_SHOWNA)` (or `SW_SHOWMINNOACTIVE` if spike 2.2 shows minimized state is lost). Hidden windows keep their z-order position, so showing preserves stacking; no reordering is done.
+- Show with `ShowWindowAsync(SW_SHOWNA)` — spike 2.2 confirmed it keeps a hidden minimized window minimized. Hidden windows keep their z-order position, so showing preserves stacking; no reordering is done.
 - Before every show, verify the id still exists and its pid + class match what was recorded (guards against in-session HWND reuse).
 - **Focus:** after a switch, `SetForegroundWindow` the topmost shown window unless it is DWM-cloaked (lives on another native virtual desktop — focusing it would switch the user's native desktop). If nothing was shown, focus the topmost visible participating window on any monitor **excluding `plan.hide`** (they may not have processed the async hide yet), else the shell window (`GetShellWindow`), so keystrokes never go to a hidden window. `SetForegroundWindow` right after an async show relies on the target thread processing the show first — verify in spike 2.3.
 
@@ -99,6 +99,12 @@ Debug builds keep a console and log, per switch, every window the filter accepte
 ## Migration Plan
 
 N/A — new app. Rollback = exit the app (restores all windows).
+
+## Spike Findings
+
+- 2.1 (filter, on the dev machine): browsers, Electron, Tauri, UWP (`ApplicationFrameWindow`), Unity, SDL, WPF, MFC windows accepted; windows on other native desktops rejected as cloaked; taskbars, Progman, PowerToys rejected. Owned non-popup windows (e.g. PowerToys Command Palette) are rejected as "owned" — `GA_ROOTOWNER` only follows popup owners, so these stay visible (sticky), as accepted in Open Questions. Some always-on-top overlays (e.g. a WPF "Resource Overlay") are accepted and will be hidden with their slot.
+- 2.2: `IsWindowVisible` is still true immediately after `ShowWindowAsync(SW_HIDE)` and false ~300 ms later — confirms §3's "no post-hide check". `SW_SHOWNA` preserves minimized state.
+- Lesson: Windows 11 Notepad reuses one process for all windows, so tests must find windows by the PID they launched, never by class.
 
 ## Open Questions
 
