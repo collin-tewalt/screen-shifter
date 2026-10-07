@@ -45,15 +45,24 @@ pub struct State {
 
 impl State {
     /// `visible` is every participating window currently on `monitor`, topmost first.
-    pub fn switch(&mut self, monitor: &str, dir: Dir, mut visible: Vec<Entry>, now_ms: u64) -> Plan {
-        let m = self.monitors.entry(monitor.to_string()).or_default();
+    pub fn switch(&mut self, monitor: &str, dir: Dir, visible: Vec<Entry>, now_ms: u64) -> Plan {
+        let active = self.active(monitor) - 1;
         let target = match dir {
-            Dir::Prev => m.active.checked_sub(1),
-            Dir::Next => (m.active + 1 < SLOTS).then_some(m.active + 1),
+            Dir::Prev => active.checked_sub(1),
+            Dir::Next => (active + 1 < SLOTS).then_some(active + 1),
         };
-        let Some(target) = target else {
+        match target {
+            Some(t) => self.switch_to(monitor, t, visible, now_ms),
+            None => Plan::default(),
+        }
+    }
+
+    /// Jump straight to 0-based `target`. No-op for the current slot.
+    pub fn switch_to(&mut self, monitor: &str, target: usize, mut visible: Vec<Entry>, now_ms: u64) -> Plan {
+        let m = self.monitors.entry(monitor.to_string()).or_default();
+        if target == m.active || target >= SLOTS {
             return Plan::default();
-        };
+        }
 
         if let Some((last, at)) = &m.last
             && now_ms.saturating_sub(*at) < RACE_WINDOW_MS
@@ -84,9 +93,54 @@ impl State {
         plan
     }
 
+    /// Move a window (root + owned `entries`) from `from` monitor into 0-based `slot` of `to`.
+    /// Returns true if the shell must hide it.
+    pub fn move_to_slot(&mut self, entries: &[Entry], from: &str, to: &str, slot: usize, now_ms: u64) -> bool {
+        let to_active = self.active(to) - 1;
+        if (from == to && slot == to_active) || slot >= SLOTS {
+            return false;
+        }
+        for m in self.monitors.values_mut() {
+            for s in &mut m.slots {
+                s.retain(|e| !contains(entries, e.id));
+            }
+            if let Some((p, _)) = &mut m.last {
+                p.hide.retain(|e| !contains(entries, e.id));
+                p.show.retain(|e| !contains(entries, e.id));
+            }
+        }
+        let hide = slot != to_active;
+        if hide {
+            let target = &mut self.monitors.entry(to.to_string()).or_default().slots[slot];
+            target.splice(0..0, entries.iter().cloned());
+        }
+        // The async hide/relocation won't have landed before a quick next snapshot.
+        self.fresh_last(from, now_ms).hide.extend(entries.iter().cloned());
+        if !hide {
+            self.fresh_last(to, now_ms).show.extend(entries.iter().cloned());
+        }
+        hide
+    }
+
+    /// The monitor's last plan if still trusted, else a new empty one stamped `now_ms`.
+    /// Never re-stamp an old plan: its stale entries would be trusted again.
+    fn fresh_last(&mut self, monitor: &str, now_ms: u64) -> &mut Plan {
+        let m = self.monitors.entry(monitor.to_string()).or_default();
+        let stale = m.last.as_ref().is_none_or(|(_, at)| now_ms.saturating_sub(*at) >= RACE_WINDOW_MS);
+        if stale {
+            m.last = Some((Plan::default(), now_ms));
+        }
+        &mut m.last.as_mut().expect("set above").0
+    }
+
     /// 1-based slot number for display.
     pub fn active(&self, monitor: &str) -> usize {
         self.monitors.get(monitor).map_or(0, |m| m.active) + 1
+    }
+
+    /// For the panel: 0-based active slot and each slot's recorded windows.
+    pub fn slots(&self, monitor: &str) -> (usize, Vec<Vec<Entry>>) {
+        self.monitors.get(monitor).map_or((0, vec![vec![]; SLOTS]), |m| (m.active, m.slots.to_vec()))
     }
 
     /// Every window currently recorded as hidden, on any monitor.
@@ -362,6 +416,82 @@ mod tests {
         assert!(!should_restore(&e, 10, "Other"));
     }
 
+    #[test]
+    fn switch_to_jumps_and_ignores_current() {
+        let mut s = State::default();
+        let p = s.switch_to(A, 3, vec![w(1)], 0);
+        assert_eq!((ids(&p.hide), s.active(A), s.active(B)), (vec![1], 4, 1));
+        assert_eq!(s.switch_to(A, 3, vec![w(2)], LATER), Plan::default());
+        let p = s.switch_to(A, 0, vec![], 2 * LATER);
+        assert_eq!(ids(&p.show), [1]);
+    }
+
+    #[test]
+    fn move_same_monitor_active_slot_is_noop() {
+        let mut s = State::default();
+        assert!(!s.move_to_slot(&[w(1)], A, A, 0, 0));
+        assert!(s.hidden().is_empty());
+        // and it leaves the race state alone: a quick switch still captures the window
+        let p = s.switch(A, Dir::Next, vec![w(1)], 10);
+        assert_eq!(ids(&p.hide), [1]);
+    }
+
+    #[test]
+    fn move_same_monitor_other_slot() {
+        let mut s = State::default();
+        assert!(s.move_to_slot(&[w(1), w(2)], A, A, 2, 0));
+        assert_eq!(s.slots(A).1[2], vec![w(1), w(2)]);
+        let p = s.switch_to(A, 2, vec![], LATER);
+        assert_eq!(ids(&p.show), [1, 2], "owned entries move with the root");
+    }
+
+    #[test]
+    fn move_to_other_monitor_active_slot_records_nothing() {
+        let mut s = State::default();
+        s.switch(A, Dir::Next, vec![w(1)], 0); // w(1) hidden in A slot 1
+        assert!(!s.move_to_slot(&[w(1)], A, B, 0, LATER));
+        assert!(s.hidden().is_empty());
+    }
+
+    #[test]
+    fn move_to_other_monitor_hidden_slot() {
+        let mut s = State::default();
+        assert!(s.move_to_slot(&[w(1)], A, B, 1, 0));
+        let p = s.switch(B, Dir::Next, vec![], LATER);
+        assert_eq!(ids(&p.show), [1]);
+    }
+
+    #[test]
+    fn quick_switch_after_move_keeps_new_slot() {
+        let mut s = State::default();
+        s.switch(A, Dir::Next, vec![w(1)], 0);
+        s.switch(A, Dir::Prev, vec![], LATER); // shows w(1)
+        s.move_to_slot(&[w(1)], A, A, 3, LATER + 100);
+        // hide hasn't landed: snapshot still lists w(1)
+        let p = s.switch(A, Dir::Next, vec![w(1)], LATER + 200);
+        assert!(!contains(&p.hide, 1));
+        assert_eq!(ids(&s.slots(A).1[3]), [1]);
+    }
+
+    #[test]
+    fn quick_switch_on_target_after_cross_monitor_move() {
+        let mut s = State::default();
+        s.move_to_slot(&[w(1)], A, B, 0, 0); // to B's active slot, relocation not landed
+        let p = s.switch(B, Dir::Next, vec![], 100);
+        assert_eq!(ids(&p.hide), [1], "pending arrival must count as visible on B");
+    }
+
+    #[test]
+    fn move_does_not_revive_stale_plan() {
+        let mut s = State::default();
+        s.switch(B, Dir::Next, vec![w(5)], 0);
+        s.switch(B, Dir::Prev, vec![], LATER); // B's last.show = [w(5)], soon stale
+        // much later: user dragged w(5) to A by hand; then a move onto B's active slot
+        s.move_to_slot(&[w(1)], A, B, 0, 5 * LATER);
+        let p = s.switch(B, Dir::Next, vec![], 5 * LATER + 100);
+        assert_eq!(ids(&p.hide), [1], "stale w(5) must not be resurrected");
+    }
+
     /// Random switches in a simulated world: no window is ever lost or duplicated.
     #[test]
     fn never_lose_a_window() {
@@ -392,6 +522,24 @@ mod tests {
                     let other = if mon == A { B } else { A };
                     if let Some(e) = screen.get_mut(mon).unwrap().pop() {
                         screen.get_mut(other).unwrap().insert(0, e);
+                    }
+                }
+                2 => {
+                    // panel drag: move a visible window to a random slot on a random monitor
+                    let to = mons[rand(2) as usize];
+                    let slot = rand(SLOTS as u64) as usize;
+                    if let Some(e) = screen[mon].first().cloned() {
+                        let hide = s.move_to_slot(std::slice::from_ref(&e), mon, to, slot, now);
+                        let to_active = s.active(to) - 1;
+                        let moved = !(mon == to && slot == to_active);
+                        if moved {
+                            screen.get_mut(mon).unwrap().retain(|v| v.id != e.id);
+                            if hide {
+                                ever_hidden.insert(e.id);
+                            } else {
+                                screen.get_mut(to).unwrap().insert(0, e);
+                            }
+                        }
                     }
                 }
                 _ => {
