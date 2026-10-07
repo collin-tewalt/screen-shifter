@@ -42,6 +42,21 @@ While `Ctrl+Alt` is held, on the monitor under the mouse cursor, the system SHAL
 - **WHEN** the user scrolls without holding `Ctrl+Alt`
 - **THEN** the application under the cursor scrolls as usual
 
+### Requirement: Normal input is never stuck
+The system MUST stop intercepting mouse input as soon as `Ctrl` or `Alt` is physically released, even if the release was not observed directly (for example while the secure desktop or a UAC prompt was shown). A mouse button press and its release MUST either both reach the application or both be intercepted.
+
+#### Scenario: Ctrl+Alt+Del while holding the chord
+- **WHEN** the user holds `Ctrl+Alt`, presses `Del`, cancels the security screen, and releases all keys
+- **THEN** the next left click and wheel scroll reach the application under the cursor
+
+#### Scenario: Chord pressed during a click
+- **WHEN** the user presses the left button on a window title bar, then presses `Ctrl+Alt`, then releases the button
+- **THEN** the application receives the button release and is not left mid-drag
+
+#### Scenario: Chord released during a drag
+- **WHEN** the user starts a drag with `Ctrl+Alt` held, releases `Ctrl+Alt`, then releases the button
+- **THEN** the drag is cancelled and the application under the cursor receives no stray button release
+
 ### Requirement: Clicking a tile jumps to that slot
 While the panel is visible, clicking a tile SHALL switch that tile's monitor directly to that slot. Clicking the current slot's tile SHALL do nothing.
 

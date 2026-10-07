@@ -19,6 +19,10 @@ The system SHALL support moving a managed window (with its owned windows) into a
 - **WHEN** window X was shown by a switch on monitor A, is moved to A's slot 4 within a second, and A is then switched again within a second
 - **THEN** X remains recorded only in A's slot 4
 
+#### Scenario: Quick switch on the target monitor after a cross-monitor move
+- **WHEN** window X is moved from monitor A to monitor B's current slot, and B is switched away within a second
+- **THEN** X is hidden with the B slot it was on, not left visible or lost
+
 ## MODIFIED Requirements
 
 ### Requirement: Slot indicator
