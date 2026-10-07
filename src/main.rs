@@ -4,12 +4,16 @@
 mod core;
 #[macro_use]
 mod win;
+mod hooks;
+mod panel;
 
-use crate::core::{Dir, SLOTS};
+use crate::core::{Dir, Entry, Plan, SLOTS};
+use std::sync::atomic::Ordering::SeqCst;
+use std::thread::JoinHandle;
 use std::cell::{Cell, RefCell};
 use std::sync::atomic::{AtomicU32, Ordering};
 use windows::Win32::Foundation::{
-    ERROR_ALREADY_EXISTS, GetLastError, HWND, LPARAM, LRESULT, RECT, WPARAM,
+    ERROR_ALREADY_EXISTS, GetLastError, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM,
 };
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -31,11 +35,23 @@ const CMD_EXIT: i32 = 2;
 const OSD_TIMER: usize = 1;
 const OSD_MS: u32 = 600;
 const OSD_SIZE: (i32, i32) = (220, 110);
+const PANEL_TIMER: usize = 2;
+const PANEL_DELAY_MS: u32 = 250;
+const TILT_GAP_MS: u64 = 400;
+const WHEEL_NOTCH: i32 = 120;
 
 thread_local! {
     static STATE: RefCell<core::State> = RefCell::default();
     static OSD: Cell<HWND> = Cell::new(HWND::default());
     static OSD_SLOT: Cell<usize> = const { Cell::new(1) };
+    static HOOKS: RefCell<Option<JoinHandle<()>>> = const { RefCell::new(None) };
+    static WHEEL: Cell<i32> = const { Cell::new(0) };
+    /// (time of last tilt event, direction) for one-switch-per-tilt bursts
+    static TILT: Cell<(u64, i32)> = const { Cell::new((0, 0)) };
+    /// Panel hit at left-down (for click-to-jump): Some(None) = panel gap
+    static PRESSED: RefCell<Option<Option<(String, usize)>>> = const { RefCell::new(None) };
+    /// Window being dragged: its monitor and root + owned entries
+    static DRAGGING: RefCell<Option<(String, Vec<Entry>)>> = const { RefCell::new(None) };
 }
 static TASKBAR_CREATED: AtomicU32 = AtomicU32::new(0);
 
@@ -70,6 +86,7 @@ fn main() {
         }
         TASKBAR_CREATED.store(RegisterWindowMessageW(w!("TaskbarCreated")), Ordering::Relaxed);
         tray(app, NIM_ADD);
+        HOOKS.with(|h| *h.borrow_mut() = Some(hooks::start(app)));
         log!("running");
 
         let mut msg = MSG::default();
@@ -130,15 +147,36 @@ unsafe fn tray(app: HWND, op: NOTIFY_ICON_MESSAGE) {
     let _ = unsafe { Shell_NotifyIconW(op, &nid) };
 }
 
-fn on_switch(dir: Dir) {
-    let (monitor, rect) = win::cursor_monitor();
+fn on_switch(monitor: String, rect: RECT, dir: Dir) {
+    run_switch(monitor, rect, |s, m, visible, now| s.switch(m, dir, visible, now));
+}
+
+/// Hook-driven switches pick the monitor from the posted point, not a fresh cursor read.
+fn switch_at(pt: POINT, dir: Dir) {
+    let (monitor, rect) = win::monitor_at(pt);
+    on_switch(monitor, rect, dir);
+}
+
+fn jump(monitor: String, slot: usize) {
+    run_switch(monitor, RECT::default(), |s, m, visible, now| s.switch_to(m, slot, visible, now));
+}
+
+/// Shared switch path: write-ahead, hide, show, persist, focus, then panel or OSD.
+fn run_switch(
+    monitor: String,
+    rect: RECT,
+    pick: impl FnOnce(&mut core::State, &str, Vec<Entry>, u64) -> Plan,
+) {
+    if hooks::DRAG.load(SeqCst) {
+        return; // never hide the window under a drag
+    }
     let visible = win::visible_windows_on(&monitor);
     // Copy everything out so no borrow is held across Win32 calls that can re-enter.
     let (old, plan, new, before, after) = STATE.with(|s| {
         let mut s = s.borrow_mut();
         let before = s.active(&monitor);
         let old = s.hidden();
-        let plan = s.switch(&monitor, dir, visible, win::now_ms());
+        let plan = pick(&mut s, &monitor, visible, win::now_ms());
         (old, plan, s.hidden(), before, s.active(&monitor))
     });
     if before == after {
@@ -150,7 +188,141 @@ fn on_switch(dir: Dir) {
     let shown = win::show(&plan.show);
     win::write_state(&new);
     win::focus_after_switch(&shown, &plan.hide);
-    show_osd(after, rect);
+    if panel::is_shown() {
+        panel::update(panel_data());
+    } else {
+        show_osd(after, rect);
+    }
+}
+
+/// Move a dragged window into a slot (design §7): write-ahead, relocate, hide, persist.
+fn do_move(entries: Vec<Entry>, from: String, to: String, slot: usize) {
+    let (old, hide, new) = STATE.with(|s| {
+        let mut s = s.borrow_mut();
+        let old = s.hidden();
+        let hide = s.move_to_slot(&entries, &from, &to, slot, win::now_ms());
+        (old, hide, s.hidden())
+    });
+    if from == to && !hide {
+        return; // dropped on its own monitor's current slot
+    }
+    log!("move {} window(s) {from} -> {to} slot {}", entries.len(), slot + 1);
+    let focused = win::has_focus(&entries);
+    win::write_state(&core::write_ahead_set(&old, &new));
+    if from != to {
+        win::relocate(&entries, &from, &to);
+    }
+    if hide {
+        win::hide(&entries);
+    }
+    win::write_state(&new);
+    if hide && focused {
+        win::focus_after_switch(&[], &entries);
+    }
+    panel::update(panel_data());
+}
+
+/// Titles per slot for every monitor. Owned dialogs are left out of the lists.
+fn panel_data() -> Vec<panel::PanelData> {
+    let titles = |entries: &[Entry]| -> Vec<String> {
+        entries
+            .iter()
+            .filter(|e| win::is_root(e.id))
+            .map(|e| win::title_of(win::hwnd(e.id)))
+            .filter(|t| !t.is_empty())
+            .collect()
+    };
+    win::monitor_names()
+        .into_iter()
+        .map(|monitor| {
+            let (active, slots) = STATE.with(|s| s.borrow().slots(&monitor));
+            let visible = win::visible_windows_on(&monitor);
+            let titles = (0..SLOTS)
+                .map(|i| if i == active { titles(&visible) } else { titles(&slots[i]) })
+                .collect();
+            panel::PanelData { monitor, active, titles }
+        })
+        .collect()
+}
+
+fn show_panels() {
+    panel::show(&win::monitors(), panel_data());
+}
+
+fn cancel_drag() {
+    if DRAGGING.with(|d| d.borrow_mut().take()).is_some() {
+        hooks::DRAG.store(false, SeqCst);
+        panel::ghost_end();
+        panel::set_drop(None);
+    }
+}
+
+fn on_wheel(delta: i32, pt: POINT) {
+    if hooks::DRAG.load(SeqCst) {
+        return;
+    }
+    let mut acc = WHEEL.get() + delta; // up (positive) = next
+    while acc >= WHEEL_NOTCH {
+        switch_at(pt, Dir::Next);
+        acc -= WHEEL_NOTCH;
+    }
+    while acc <= -WHEEL_NOTCH {
+        switch_at(pt, Dir::Prev);
+        acc += WHEEL_NOTCH;
+    }
+    WHEEL.set(acc);
+}
+
+/// A held tilt repeats; switch once per burst (right = next).
+fn on_tilt(delta: i32, pt: POINT) {
+    let dir = delta.signum();
+    let now = win::now_ms();
+    let (last, last_dir) = TILT.replace((now, dir));
+    if dir != 0 && (dir != last_dir || now.saturating_sub(last) > TILT_GAP_MS) && !hooks::DRAG.load(SeqCst) {
+        switch_at(pt, if dir > 0 { Dir::Next } else { Dir::Prev });
+    }
+}
+
+fn on_ldown(pt: POINT) {
+    if hooks::DRAG.load(SeqCst) {
+        return;
+    }
+    if panel::is_shown()
+        && let Some(hit) = panel::hit(pt)
+    {
+        PRESSED.with(|p| *p.borrow_mut() = Some(hit));
+        return;
+    }
+    let Some((monitor, entries)) = win::root_at(pt) else { return };
+    let root = entries.iter().find(|e| win::is_root(e.id)).unwrap_or(&entries[0]).id;
+    log!("drag start {:x} on {monitor}", root);
+    hooks::DRAG.store(true, SeqCst);
+    DRAGGING.with(|d| *d.borrow_mut() = Some((monitor, entries)));
+    panel::ghost_start(win::hwnd(root), pt);
+}
+
+fn on_lup(pt: POINT) {
+    if let Some((from, entries)) = DRAGGING.with(|d| d.borrow_mut().take()) {
+        hooks::DRAG.store(false, SeqCst);
+        panel::ghost_end();
+        panel::set_drop(None);
+        if let Some(Some((to, slot))) = panel::hit(pt) {
+            do_move(entries, from, to, slot);
+        }
+        return;
+    }
+    if let Some(Some(pressed)) = PRESSED.with(|p| p.borrow_mut().take())
+        && panel::hit(pt) == Some(Some(pressed.clone()))
+    {
+        jump(pressed.0, pressed.1);
+    }
+}
+
+fn on_move() {
+    hooks::MOVE_PENDING.store(false, SeqCst);
+    let pt = hooks::unpack(hooks::MOVE_PT.load(SeqCst));
+    panel::ghost_move(pt);
+    panel::set_drop(panel::hit(pt).flatten());
 }
 
 fn restore_all() {
@@ -207,12 +379,39 @@ unsafe extern "system" fn app_proc(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) ->
     unsafe {
         match msg {
             WM_HOTKEY => match wp.0 as i32 {
-                HK_PREV => on_switch(Dir::Prev),
-                HK_NEXT => on_switch(Dir::Next),
+                HK_PREV => {
+                    let (m, r) = win::cursor_monitor();
+                    on_switch(m, r, Dir::Prev);
+                }
+                HK_NEXT => {
+                    let (m, r) = win::cursor_monitor();
+                    on_switch(m, r, Dir::Next);
+                }
                 HK_PANIC => panic!("debug panic drill"),
                 _ => {}
             },
             WM_TRAY if matches!(lp.0 as u32, WM_RBUTTONUP | WM_CONTEXTMENU) => tray_menu(h),
+            hooks::WM_CHORD_DOWN => {
+                SetTimer(Some(h), PANEL_TIMER, PANEL_DELAY_MS, None);
+            }
+            WM_TIMER if wp.0 == PANEL_TIMER => {
+                let _ = KillTimer(Some(h), PANEL_TIMER);
+                if hooks::CHORD.load(SeqCst) {
+                    show_panels();
+                }
+            }
+            hooks::WM_CHORD_UP => {
+                let _ = KillTimer(Some(h), PANEL_TIMER);
+                cancel_drag();
+                panel::hide();
+                WHEEL.set(0);
+                PRESSED.with(|p| p.borrow_mut().take());
+            }
+            hooks::WM_HOOK_WHEEL => on_wheel(wp.0 as isize as i32, hooks::unpack(lp.0 as u64)),
+            hooks::WM_HOOK_HWHEEL => on_tilt(wp.0 as isize as i32, hooks::unpack(lp.0 as u64)),
+            hooks::WM_HOOK_LDOWN => on_ldown(hooks::unpack(lp.0 as u64)),
+            hooks::WM_HOOK_LUP => on_lup(hooks::unpack(lp.0 as u64)),
+            hooks::WM_HOOK_MOVE => on_move(),
             WM_QUERYENDSESSION => {
                 restore_all(); // so "save changes?" prompts are visible
                 return LRESULT(1);
@@ -223,6 +422,9 @@ unsafe extern "system" fn app_proc(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) ->
                     log!("monitor set changed: restoring {}", entries.len());
                     win::show(&entries);
                     win::write_state(&[]);
+                }
+                if panel::is_shown() {
+                    show_panels(); // rebuild for the new layout
                 }
             }
             WM_DESTROY => PostQuitMessage(0),
@@ -247,6 +449,11 @@ unsafe fn tray_menu(app: HWND) {
             CMD_RESTORE => restore_all(),
             CMD_EXIT => {
                 restore_all();
+                cancel_drag();
+                panel::hide();
+                if let Some(h) = HOOKS.with(|h| h.borrow_mut().take()) {
+                    hooks::stop(h);
+                }
                 let _ = UnregisterHotKey(Some(app), HK_PREV);
                 let _ = UnregisterHotKey(Some(app), HK_NEXT);
                 tray(app, NIM_DELETE);

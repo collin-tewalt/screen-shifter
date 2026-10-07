@@ -12,6 +12,10 @@ use windows::Win32::Graphics::Gdi::{
     MONITORINFOEXW, MonitorFromPoint, MonitorFromRect, MonitorFromWindow,
 };
 use windows::Win32::System::Threading::GetCurrentProcessId;
+use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    INPUT, INPUT_0, INPUT_KEYBOARD, KEYBD_EVENT_FLAGS, KEYBDINPUT, KEYEVENTF_KEYUP, SendInput, VIRTUAL_KEY,
+};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 #[macro_export]
@@ -47,16 +51,43 @@ fn monitor_name(m: HMONITOR) -> String {
     String::from_utf16_lossy(&dev[..len])
 }
 
-pub fn monitor_names() -> Vec<String> {
+pub struct MonitorInfo {
+    pub name: String,
+    pub work: RECT,
+    /// DPI scale, 1.0 = 96 dpi
+    pub scale: f32,
+}
+
+pub fn monitors() -> Vec<MonitorInfo> {
     unsafe extern "system" fn cb(m: HMONITOR, _: HDC, _: *mut RECT, lp: LPARAM) -> BOOL {
-        unsafe { (*(lp.0 as *mut Vec<String>)).push(monitor_name(m)) };
+        let (mut dx, mut dy) = (96, 96);
+        unsafe {
+            let _ = GetDpiForMonitor(m, MDT_EFFECTIVE_DPI, &mut dx, &mut dy);
+            (*(lp.0 as *mut Vec<MonitorInfo>)).push(MonitorInfo {
+                name: monitor_name(m),
+                work: monitor_info(m).monitorInfo.rcWork,
+                scale: dx as f32 / 96.0,
+            });
+        }
         TRUE
     }
-    let mut names = Vec::new();
+    let mut v = Vec::new();
     unsafe {
-        let _ = EnumDisplayMonitors(None, None, Some(cb), LPARAM(&mut names as *mut _ as isize));
+        let _ = EnumDisplayMonitors(None, None, Some(cb), LPARAM(&mut v as *mut _ as isize));
     }
-    names
+    v
+}
+
+pub fn monitor_names() -> Vec<String> {
+    monitors().into_iter().map(|m| m.name).collect()
+}
+
+/// Name and full rect of the monitor containing a screen point.
+pub fn monitor_at(pt: POINT) -> (String, RECT) {
+    unsafe {
+        let m = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
+        (monitor_name(m), monitor_info(m).monitorInfo.rcMonitor)
+    }
 }
 
 /// Name and full rect of the monitor under the mouse cursor.
@@ -64,9 +95,8 @@ pub fn cursor_monitor() -> (String, RECT) {
     let mut pt = POINT::default();
     unsafe {
         let _ = GetCursorPos(&mut pt);
-        let m = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
-        (monitor_name(m), monitor_info(m).monitorInfo.rcMonitor)
     }
+    monitor_at(pt)
 }
 
 fn primary_work_area() -> RECT {
@@ -107,7 +137,7 @@ fn class_of(h: HWND) -> String {
     String::from_utf16_lossy(&buf[..n.max(0) as usize])
 }
 
-fn title_of(h: HWND) -> String {
+pub fn title_of(h: HWND) -> String {
     let mut buf = [0u16; 256];
     let n = unsafe { GetWindowTextW(h, &mut buf) };
     String::from_utf16_lossy(&buf[..n.max(0) as usize])
@@ -194,6 +224,24 @@ fn classify(h: HWND) -> Result<String, &'static str> {
     }
 }
 
+/// True for a top-level window that isn't owned by another (not a dialog/popup).
+pub fn is_root(id: u64) -> bool {
+    unsafe { GetAncestor(hwnd(id), GA_ROOTOWNER) == hwnd(id) }
+}
+
+/// The managed window under a screen point: its monitor and its root + visible owned
+/// windows, topmost first. None for the desktop, taskbar, our own windows, etc.
+pub fn root_at(pt: POINT) -> Option<(String, Vec<Entry>)> {
+    let root = unsafe { GetAncestor(WindowFromPoint(pt), GA_ROOTOWNER) };
+    let monitor = classify(root).ok()?;
+    let entries = top_level_windows()
+        .into_iter()
+        .filter(|&h| unsafe { GetAncestor(h, GA_ROOTOWNER) } == root && classify(h).is_ok())
+        .map(entry)
+        .collect();
+    Some((monitor, entries))
+}
+
 /// Participating windows on `monitor`, topmost first.
 pub fn visible_windows_on(monitor: &str) -> Vec<Entry> {
     top_level_windows()
@@ -263,18 +311,46 @@ fn bring_on_screen(h: HWND) {
     let (rw, rh) = ((r.right - r.left).min(w), (r.bottom - r.top).min(ht));
     // workspace coordinates: (0,0) is the primary work area's top-left
     *r = RECT { left: 0, top: 0, right: rw, bottom: rh };
+    set_placement_async(h, &mut p);
+    log!("moved off-screen window {:x} to primary", h.0 as usize);
+}
+
+/// Applies a placement without activating the window (where Windows allows) and without
+/// waiting on its thread, keeping it minimized/maximized.
+fn set_placement_async(h: HWND, p: &mut WINDOWPLACEMENT) {
     unsafe {
         p.showCmd = if IsIconic(h).as_bool() {
             SW_SHOWMINNOACTIVE.0 as u32
         } else if IsZoomed(h).as_bool() {
-            SW_SHOWMAXIMIZED.0 as u32
+            SW_SHOWMAXIMIZED.0 as u32 // activates briefly; accepted (design risks)
         } else {
             SW_SHOWNOACTIVATE.0 as u32
         };
         p.flags |= WPF_ASYNCWINDOWPLACEMENT;
-        let _ = SetWindowPlacement(h, &p);
+        let _ = SetWindowPlacement(h, p);
     }
-    log!("moved off-screen window {:x} to primary", h.0 as usize);
+}
+
+/// Move windows from one monitor to another, keeping their position relative to the work area.
+pub fn relocate(entries: &[Entry], from: &str, to: &str) {
+    let mons = monitors();
+    let work = |name: &str| mons.iter().find(|m| m.name == name).map(|m| m.work);
+    let (Some(a), Some(b)) = (work(from), work(to)) else { return };
+    let pwa = primary_work_area();
+    for e in entries {
+        let h = hwnd(e.id);
+        if unsafe { IsHungAppWindow(h).as_bool() } {
+            continue;
+        }
+        let Some(mut p) = placement(h) else { continue };
+        // rcNormalPosition is in workspace coords (relative to the primary work area)
+        let r = p.rcNormalPosition;
+        let (w, ht) = ((r.right - r.left).min(b.right - b.left), (r.bottom - r.top).min(b.bottom - b.top));
+        let left = (r.left + b.left - a.left).clamp(b.left - pwa.left, b.right - pwa.left - w);
+        let top = (r.top + b.top - a.top).clamp(b.top - pwa.top, b.bottom - pwa.top - ht);
+        p.rcNormalPosition = RECT { left, top, right: left + w, bottom: top + ht };
+        set_placement_async(h, &mut p);
+    }
 }
 
 /// Keystrokes must never go to a hidden window.
@@ -291,8 +367,23 @@ pub fn focus_after_switch(shown: &[Entry], just_hidden: &[Entry]) {
         })
         .unwrap_or_else(|| unsafe { GetShellWindow() });
     unsafe {
-        let _ = SetForegroundWindow(target);
+        if !SetForegroundWindow(target).as_bool() {
+            // Hook-driven switches may lack the foreground right; any input event from our
+            // process grants it. 0xE8 is unassigned, so no app reacts to it.
+            let key = |flags| INPUT {
+                r#type: INPUT_KEYBOARD,
+                Anonymous: INPUT_0 { ki: KEYBDINPUT { wVk: VIRTUAL_KEY(0xE8), dwFlags: flags, ..Default::default() } },
+            };
+            SendInput(&[key(KEYBD_EVENT_FLAGS(0)), key(KEYEVENTF_KEYUP)], size_of::<INPUT>() as i32);
+            let _ = SetForegroundWindow(target);
+        }
     }
+}
+
+/// Is `id` the foreground window or one of its owned windows?
+pub fn has_focus(entries: &[Entry]) -> bool {
+    let fg = unsafe { GetForegroundWindow() }.0 as u64;
+    entries.iter().any(|e| e.id == fg)
 }
 
 // ---------- state file ----------
