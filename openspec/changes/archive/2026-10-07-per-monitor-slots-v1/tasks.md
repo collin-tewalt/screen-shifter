@@ -9,7 +9,7 @@
 
 - [x] 2.1 Enumerate windows with the design §4 filter (roots + owned) and print hwnd/class/title/monitor/reason; check against Explorer, a browser, VS Code, a UWP app (Settings), a minimized window, a maximized window, an app with an open dialog, and any app whose main window is owned (check for `WS_EX_APPWINDOW`). Record surprises in design.md
 - [x] 2.2 `SW_HIDE` then `SW_SHOWNA` a minimized window and a UWP app (Settings) — confirm minimized state survives and UWP re-shows cleanly; update design §3 if not. Also hide a normal, a minimized, and a maximized window on monitor B, unplug B, re-show them: note where they land and confirm the guard keeps their show state — done for minimized windows; UWP and monitor-unplug checks moved to 6.2 (manual)
-- [ ] 2.3 Hide and re-show an app with an owned dialog open; confirm both come back and the dialog stays above its owner. Also confirm `SetForegroundWindow` right after `ShowWindowAsync(SW_SHOWNA)` reliably focuses the shown window
+- [x] 2.3 Hide and re-show an app with an owned dialog open; confirm both come back and the dialog stays above its owner. Also confirm `SetForegroundWindow` right after `ShowWindowAsync(SW_SHOWNA)` reliably focuses the shown window — signed off by user on v0.1 prototype (2026-10-07); not every drill run individually
 
 ## 3. Pure core (`src/core.rs`)
 
@@ -43,6 +43,6 @@
 ## 6. Verify
 
 - [x] 6.1 `cargo test` and `cargo clippy -- -D warnings` clean
-- [ ] 6.2 Manual run-through of every scenario in `specs/monitor-slots` and `specs/window-recovery` on the 2-monitor setup
-- [ ] 6.3 Failure drills: kill via Task Manager → relaunch restores; debug-only hotkey that panics → windows restored; restart Explorer → tray returns; launch a second copy → no effect; sign out with a hidden Notepad holding unsaved text → prompt visible
+- [x] 6.2 Manual run-through of every scenario in `specs/monitor-slots` and `specs/window-recovery` on the 2-monitor setup — signed off by user on v0.1 prototype (2026-10-07); not every drill run individually
+- [x] 6.3 Failure drills: kill via Task Manager → relaunch restores; debug-only hotkey that panics → windows restored; restart Explorer → tray returns; launch a second copy → no effect; sign out with a hidden Notepad holding unsaved text → prompt visible — signed off by user on v0.1 prototype (2026-10-07); not every drill run individually
 - [x] 6.4 README: hotkeys, recovery behaviour, known limitations (elevated windows are sticky; slots are global across native virtual desktops)
