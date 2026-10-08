@@ -97,6 +97,7 @@ struct Sheet {
     frames: u32,
     last: u64,
     worst_gap: u64,
+    draw_us: u128,
     /// Created since the last composed frame: its capture would be stale for another switch.
     fresh: bool,
 }
@@ -219,7 +220,7 @@ pub fn start_sheet(monitor: &str, rect: RECT, slide: Slide, scale: f32, now: u64
         .unwrap_or_default()
     };
     exclude_from_capture(hwnd);
-    let sheet = Sheet { monitor: monitor.to_string(), hwnd, dc, bmp, old, rect, width, motion, created: now, started: false, frames: 0, last: 0, worst_gap: 0, fresh: true };
+    let sheet = Sheet { monitor: monitor.to_string(), hwnd, dc, bmp, old, rect, width, motion, created: now, started: false, frames: 0, last: 0, worst_gap: 0, draw_us: 0, fresh: true };
     sheet.draw(now);
     // Below any sheets still moving on this monitor; they hurry off on top of it.
     let below = SHEETS.with(|s| {
@@ -252,11 +253,15 @@ pub fn step(now: u64) {
         sheet.worst_gap = sheet.worst_gap.max(now.saturating_sub(sheet.last));
         sheet.last = now;
         let expired = now.saturating_sub(sheet.created) > HARD_LIMIT_MS;
-        if !expired && sheet.draw(now) && !sheet.motion.done(now) {
+        let t = std::time::Instant::now();
+        let drawn = !expired && sheet.draw(now);
+        sheet.draw_us += t.elapsed().as_micros();
+        if drawn && !sheet.motion.done(now) {
             keep.push(sheet);
         } else {
-            crate::log!("  slide: {} frames in {} ms, worst gap {} ms{}", sheet.frames,
-                now.saturating_sub(sheet.motion.start), sheet.worst_gap, if expired { " (hard limit)" } else { "" });
+            crate::log!("  slide: {} frames in {} ms, worst gap {} ms, avg draw {:.1} ms{}", sheet.frames,
+                now.saturating_sub(sheet.motion.start), sheet.worst_gap,
+                sheet.draw_us as f64 / 1000.0 / sheet.frames.max(1) as f64, if expired { " (hard limit)" } else { "" });
             sheet.destroy();
         }
     }

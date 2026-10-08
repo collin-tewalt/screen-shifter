@@ -264,7 +264,8 @@ fn run_switch(monitor: String, pick: impl FnOnce(&mut core::State, &str, Vec<Ent
     win::focus_after_switch(&shown, &plan.hide);
     let t_focus = ms(t);
     if panel::is_shown() {
-        panel::update(panel_data());
+        // The new slot's windows are exactly the ones just shown: no need to re-enumerate.
+        panel::update(vec![panel_data_for(monitor.clone(), &plan.show)]);
     } else {
         show_osd(after, rect);
     }
@@ -314,25 +315,30 @@ fn soul_home(entries: &[Entry]) {
     }
 }
 
-/// Titles per slot for every monitor. Owned dialogs are left out of the lists.
+/// Titles of root windows (owned dialogs are left out of the lists).
+fn titles(entries: &[Entry]) -> Vec<String> {
+    entries
+        .iter()
+        .filter(|e| win::is_root(e.id))
+        .map(|e| win::title_of(win::hwnd(e.id)))
+        .filter(|t| !t.is_empty())
+        .collect()
+}
+
+/// One monitor's panel contents; `visible` = what's on screen in its current slot.
+fn panel_data_for(monitor: String, visible: &[Entry]) -> panel::PanelData {
+    let (active, slots) = STATE.with(|s| s.borrow().slots(&monitor));
+    let titles = (0..SLOTS).map(|i| if i == active { titles(visible) } else { titles(&slots[i]) }).collect();
+    panel::PanelData { monitor, active, titles }
+}
+
+/// Every monitor, enumerating what's visible (tens of ms: use only when the panel opens).
 fn panel_data() -> Vec<panel::PanelData> {
-    let titles = |entries: &[Entry]| -> Vec<String> {
-        entries
-            .iter()
-            .filter(|e| win::is_root(e.id))
-            .map(|e| win::title_of(win::hwnd(e.id)))
-            .filter(|t| !t.is_empty())
-            .collect()
-    };
     win::monitor_names()
         .into_iter()
         .map(|monitor| {
-            let (active, slots) = STATE.with(|s| s.borrow().slots(&monitor));
             let visible = win::visible_windows_on(&monitor);
-            let titles = (0..SLOTS)
-                .map(|i| if i == active { titles(&visible) } else { titles(&slots[i]) })
-                .collect();
-            panel::PanelData { monitor, active, titles }
+            panel_data_for(monitor, &visible)
         })
         .collect()
 }
