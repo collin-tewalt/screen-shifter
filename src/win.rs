@@ -29,9 +29,10 @@ pub fn hwnd(id: u64) -> HWND {
     HWND(id as *mut c_void)
 }
 
+/// Monotonic milliseconds since first use (wall-clock time can jump when Windows syncs it).
 pub fn now_ms() -> u64 {
-    let since = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH);
-    since.map_or(0, |d| d.as_millis() as u64)
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    START.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64
 }
 
 // ---------- monitors ----------

@@ -18,3 +18,8 @@ features = [
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
 ]
+
+# Optimized debug builds: the per-pixel capture loop is ~50x slower unoptimized,
+# which made debug runs unrepresentative of release timing. Logs stay on.
+[profile.dev]
+opt-level = 2

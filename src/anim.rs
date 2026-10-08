@@ -93,6 +93,10 @@ struct Sheet {
     /// The motion's clock starts at the first animation frame, not at creation: the
     /// capture and the switch work in between would otherwise eat most of the slide.
     started: bool,
+    /// diagnostics: frames drawn, last frame time, worst gap between frames
+    frames: u32,
+    last: u64,
+    worst_gap: u64,
     /// Created since the last composed frame: its capture would be stale for another switch.
     fresh: bool,
 }
@@ -200,7 +204,9 @@ pub fn start_sheet(monitor: &str, rect: RECT, slide: Slide, scale: f32, now: u64
         return false;
     }
     let shadow = (SHADOW as f32 * scale) as i32;
+    let t = std::time::Instant::now();
     let Some((dc, bmp, old, width)) = capture(rect, slide, shadow) else { return false };
+    crate::log!("  capture {:.1} ms", t.elapsed().as_secs_f64() * 1000.0);
     let (_, motion) = sheet_layout(slide, rect.left, rect.right - rect.left, shadow, now);
     let hwnd = unsafe {
         let inst = GetModuleHandleW(None).unwrap_or_default().into();
@@ -213,7 +219,7 @@ pub fn start_sheet(monitor: &str, rect: RECT, slide: Slide, scale: f32, now: u64
         .unwrap_or_default()
     };
     exclude_from_capture(hwnd);
-    let sheet = Sheet { monitor: monitor.to_string(), hwnd, dc, bmp, old, rect, width, motion, created: now, started: false, fresh: true };
+    let sheet = Sheet { monitor: monitor.to_string(), hwnd, dc, bmp, old, rect, width, motion, created: now, started: false, frames: 0, last: 0, worst_gap: 0, fresh: true };
     sheet.draw(now);
     // Below any sheets still moving on this monitor; they hurry off on top of it.
     let below = SHEETS.with(|s| {
@@ -240,11 +246,17 @@ pub fn step(now: u64) {
             crate::log!("sheet on {}: first frame {} ms after capture", sheet.monitor, now.saturating_sub(sheet.created));
             sheet.motion.start = now;
             sheet.started = true;
+            sheet.last = now;
         }
+        sheet.frames += 1;
+        sheet.worst_gap = sheet.worst_gap.max(now.saturating_sub(sheet.last));
+        sheet.last = now;
         let expired = now.saturating_sub(sheet.created) > HARD_LIMIT_MS;
         if !expired && sheet.draw(now) && !sheet.motion.done(now) {
             keep.push(sheet);
         } else {
+            crate::log!("  slide: {} frames in {} ms, worst gap {} ms{}", sheet.frames,
+                now.saturating_sub(sheet.motion.start), sheet.worst_gap, if expired { " (hard limit)" } else { "" });
             sheet.destroy();
         }
     }

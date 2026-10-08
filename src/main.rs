@@ -238,6 +238,7 @@ fn run_switch(monitor: String, pick: impl FnOnce(&mut core::State, &str, Vec<Ent
     log!("{monitor}: slot {before} -> {after}, hide {}, show {}", plan.hide.len(), plan.show.len());
     let info = win::monitors().into_iter().find(|m| m.name == monitor);
     let rect = info.as_ref().map_or(RECT::default(), |m| m.rect);
+    let t_sheet = std::time::Instant::now();
     if motion_on()
         && let Some(m) = &info
     {
@@ -249,18 +250,26 @@ fn run_switch(monitor: String, pick: impl FnOnce(&mut core::State, &str, Vec<Ent
                 let _ = DwmFlush();
                 SetTimer(Some(APP.get()), ANIM_TIMER, ANIM_TIMER_MS, None);
             }
+            log!("  sheet up (capture + flush) {:.1} ms", t_sheet.elapsed().as_secs_f64() * 1000.0);
         }
     }
+    let t = std::time::Instant::now();
+    let ms = |t: std::time::Instant| t.elapsed().as_secs_f64() * 1000.0;
     win::write_state(&core::write_ahead_set(&old, &new));
+    let t_write = ms(t);
     win::hide(&plan.hide);
     let shown = win::show(&plan.show);
+    let t_hideshow = ms(t);
     win::write_state(&new);
     win::focus_after_switch(&shown, &plan.hide);
+    let t_focus = ms(t);
     if panel::is_shown() {
         panel::update(panel_data());
     } else {
         show_osd(after, rect);
     }
+    log!("  work: write-ahead {t_write:.1}, +hide/show {:.1}, +persist/focus {:.1}, +panel/osd {:.1} ms",
+        t_hideshow - t_write, t_focus - t_hideshow, ms(t) - t_focus);
 }
 
 enum Moved {
