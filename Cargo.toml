@@ -12,6 +12,7 @@ features = [
     "Win32_Security",
     "Win32_Storage_Xps",
     "Win32_System_LibraryLoader",
+    "Win32_System_SystemInformation",
     "Win32_System_Threading",
     "Win32_UI_HiDpi",
     "Win32_UI_Input_KeyboardAndMouse",
@@ -23,3 +24,9 @@ features = [
 # which made debug runs unrepresentative of release timing. Logs stay on.
 [profile.dev]
 opt-level = 2
+# A panic anywhere (including the hooks thread) shows every saved window, then ends the
+# process; the next start takes them back. Unwinding would leave the app running out of sync.
+panic = "abort"
+
+[profile.release]
+panic = "abort"

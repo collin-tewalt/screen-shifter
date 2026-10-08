@@ -2,7 +2,7 @@
 //! Display only: they never take focus or clicks. All input arrives through the hooks.
 
 use crate::anim::{self, ease_out};
-use crate::core::SLOTS;
+use crate::core::{MAX_SLOTS, Target};
 use crate::win::{self, MonitorInfo};
 use std::cell::{Cell, RefCell};
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM};
@@ -23,7 +23,9 @@ struct Panel {
     data: PanelData,
     hwnd: HWND,
     rect: RECT, // screen coordinates
+    /// Drawing scale: the monitor's DPI scale, shrunk if the tiles wouldn't fit.
     scale: f32,
+    monitor: MonitorInfo,
 }
 
 /// The ghost's scaled snapshot, kept after the drag so the soul can fly with it.
@@ -43,7 +45,7 @@ struct Flight {
 
 thread_local! {
     static PANELS: RefCell<Vec<Panel>> = const { RefCell::new(Vec::new()) };
-    static DROP: RefCell<Option<(String, usize)>> = const { RefCell::new(None) };
+    static DROP: RefCell<Option<(String, Target)>> = const { RefCell::new(None) };
     static GHOST: Cell<HWND> = Cell::new(HWND::default());
     static SNAP: RefCell<Option<Snap>> = const { RefCell::new(None) };
     static FLIGHT: RefCell<Option<Flight>> = const { RefCell::new(None) };
@@ -75,6 +77,28 @@ fn tile_rect(i: usize, scale: f32) -> RECT {
     let (tw, th, g) = (px(TILE.0, scale), px(TILE.1, scale), px(GAP, scale));
     let left = g + i as i32 * (tw + g);
     RECT { left, top: g, right: left + tw, bottom: g + th }
+}
+
+/// Slot tiles plus "+ New" below the limit.
+fn tiles(data: &PanelData) -> usize {
+    data.titles.len() + (data.titles.len() < MAX_SLOTS) as usize
+}
+
+/// What tile `i` stands for.
+fn target(data: &PanelData, i: usize) -> Target {
+    if i < data.titles.len() { Target::Slot(i) } else { Target::New }
+}
+
+/// Screen rect and drawing scale for a panel of `tiles` tiles, kept within 90% of the
+/// monitor's width.
+fn place(m: &MonitorInfo, tiles: usize) -> (RECT, f32) {
+    let natural = tiles as i32 * (TILE.0 + GAP) + GAP;
+    let fit = 0.9 * (m.rect.right - m.rect.left) as f32 / natural as f32;
+    let s = m.scale.min(fit);
+    let (w, h) = (px(natural, s), px(TILE.1 + 2 * GAP, s));
+    let left = (m.work.left + m.work.right - w) / 2;
+    let top = m.work.bottom - h - px(48, m.scale);
+    (RECT { left, top, right: left + w, bottom: top + h }, s)
 }
 
 fn class(name: PCWSTR, proc_: WNDPROC) -> PCWSTR {
@@ -114,17 +138,13 @@ pub fn show(monitors: &[MonitorInfo], mut data: Vec<PanelData>) {
     for m in monitors {
         let Some(i) = data.iter().position(|d| d.monitor == m.name) else { continue };
         let d = data.swap_remove(i);
-        let s = m.scale;
-        let (w, h) = (px(SLOTS as i32 * (TILE.0 + GAP) + GAP, s), px(TILE.1 + 2 * GAP, s));
-        let left = (m.work.left + m.work.right - w) / 2;
-        let top = m.work.bottom - h - px(48, s);
-        let rect = RECT { left, top, right: left + w, bottom: top + h };
+        let (rect, s) = place(m, tiles(&d));
         let hwnd = overlay(cls, rect);
         anim::exclude_from_capture(hwnd);
         unsafe {
             let _ = SetLayeredWindowAttributes(hwnd, COLORREF(0), 235, LWA_ALPHA);
         }
-        panels.push(Panel { data: d, hwnd, rect, scale: s });
+        panels.push(Panel { data: d, hwnd, rect, scale: s, monitor: m.clone() });
     }
     let hwnds: Vec<HWND> = panels.iter().map(|p| p.hwnd).collect();
     PANELS.with(|p| *p.borrow_mut() = panels);
@@ -153,8 +173,15 @@ pub fn update(mut data: Vec<PanelData>) {
     PANELS.with(|p| {
         for panel in p.borrow_mut().iter_mut() {
             if let Some(i) = data.iter().position(|d| d.monitor == panel.data.monitor) {
+                let resize = tiles(&data[i]) != tiles(&panel.data);
                 panel.data = data.swap_remove(i);
                 unsafe {
+                    if resize {
+                        (panel.rect, panel.scale) = place(&panel.monitor, tiles(&panel.data));
+                        let r = panel.rect;
+                        let _ = SetWindowPos(panel.hwnd, None, r.left, r.top, r.right - r.left, r.bottom - r.top,
+                            SWP_NOZORDER | SWP_NOACTIVATE);
+                    }
                     let _ = InvalidateRect(Some(panel.hwnd), None, false);
                 }
             }
@@ -163,13 +190,13 @@ pub fn update(mut data: Vec<PanelData>) {
 }
 
 /// None: not over a panel. Some(None): over a panel but between tiles. Some(Some(tile)).
-pub fn hit(pt: POINT) -> Option<Option<(String, usize)>> {
+pub fn hit(pt: POINT) -> Option<Option<(String, Target)>> {
     PANELS.with(|p| {
         let p = p.borrow();
         let panel = p.iter().find(|p| unsafe { PtInRect(&p.rect, pt).as_bool() })?;
         let local = POINT { x: pt.x - panel.rect.left, y: pt.y - panel.rect.top };
-        let tile = (0..SLOTS).find(|&i| unsafe { PtInRect(&tile_rect(i, panel.scale), local).as_bool() });
-        Some(tile.map(|i| (panel.data.monitor.clone(), i)))
+        let tile = (0..tiles(&panel.data)).find(|&i| unsafe { PtInRect(&tile_rect(i, panel.scale), local).as_bool() });
+        Some(tile.map(|i| (panel.data.monitor.clone(), target(&panel.data, i))))
     })
 }
 
@@ -288,7 +315,7 @@ fn drop_snap() {
     }
 }
 
-pub fn set_drop(target: Option<(String, usize)>) {
+pub fn set_drop(target: Option<(String, Target)>) {
     let changed = DROP.with(|d| d.replace(target.clone()) != target);
     if changed {
         PANELS.with(|p| {
@@ -347,9 +374,25 @@ unsafe fn paint(h: HWND) {
             fill(dc, &rc, BG);
             SetBkMode(dc, TRANSPARENT);
             let (big, small) = (font(px(22, s), FW_SEMIBOLD.0 as i32), font(px(15, s), FW_NORMAL.0 as i32));
-            for i in 0..SLOTS {
+            for i in 0..tiles(&panel.data) {
                 let r = tile_rect(i, s);
-                let is_drop = drop.as_ref().is_some_and(|(m, t)| *m == panel.data.monitor && *t == i);
+                let is_drop = drop.as_ref().is_some_and(|(m, t)| *m == panel.data.monitor && *t == target(&panel.data, i));
+                if target(&panel.data, i) == Target::New {
+                    if is_drop {
+                        fill(dc, &r, DROP_BG);
+                    }
+                    let pen = CreatePen(PS_DASH, 1, DIM);
+                    let (old_pen, old_brush) = (SelectObject(dc, pen.into()), SelectObject(dc, GetStockObject(NULL_BRUSH)));
+                    let _ = Rectangle(dc, r.left, r.top, r.right, r.bottom);
+                    SelectObject(dc, old_pen);
+                    SelectObject(dc, old_brush);
+                    let _ = DeleteObject(pen.into());
+                    let old = SelectObject(dc, big.into());
+                    let mut tr = r;
+                    text(dc, "+ New", &mut tr, DIM, DT_CENTER | DT_VCENTER);
+                    SelectObject(dc, old);
+                    continue;
+                }
                 if i == panel.data.active {
                     fill(dc, &r, ACCENT);
                 }

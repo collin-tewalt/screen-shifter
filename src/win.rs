@@ -1,8 +1,11 @@
 //! Thin unsafe Win32 shell: gather windows, hide/show them, monitors, state file.
 
-use crate::core::{self, Entry};
+use crate::core::{self, Check, Entry, Layout, State, Tagged};
 use std::ffi::c_void;
 use std::path::PathBuf;
+use std::sync::OnceLock;
+use std::time::{SystemTime, UNIX_EPOCH};
+use windows::Win32::System::SystemInformation::GetTickCount64;
 use windows::Win32::Foundation::{HWND, LPARAM, POINT, RECT, TRUE};
 use windows::core::BOOL;
 use windows::Win32::Graphics::Dwm::{DWMWA_CLOAKED, DwmGetWindowAttribute};
@@ -52,6 +55,7 @@ fn monitor_name(m: HMONITOR) -> String {
     String::from_utf16_lossy(&dev[..len])
 }
 
+#[derive(Clone)]
 pub struct MonitorInfo {
     pub name: String,
     pub rect: RECT,
@@ -411,32 +415,64 @@ fn state_path() -> PathBuf {
     base.join("screen-shifter").join("hidden.txt")
 }
 
-/// Atomic: write a temp file, then rename over the real one.
-pub fn write_state(entries: &[Entry]) {
+/// When Windows started, in ms since the Unix epoch (fixed for the life of the process).
+/// Saved window handles mean nothing after a restart.
+pub fn boot_time() -> u64 {
+    static BOOT: OnceLock<u64> = OnceLock::new();
+    *BOOT.get_or_init(|| {
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as u64);
+        now.saturating_sub(unsafe { GetTickCount64() })
+    })
+}
+
+/// Atomic: write a temp file, then rename over the real one. `extra` = windows about to be shown.
+pub fn write_state(state: &State, extra: &[Tagged]) {
     let path = state_path();
     let tmp = path.with_extension("txt.tmp");
     let result = std::fs::create_dir_all(path.parent().unwrap())
-        .and_then(|_| std::fs::write(&tmp, core::serialize(entries)))
+        .and_then(|_| std::fs::write(&tmp, state.serialize(boot_time(), extra)))
         .and_then(|_| std::fs::rename(&tmp, &path));
     if let Err(e) = result {
         log!("state file write failed: {e}");
     }
 }
 
-pub fn read_state() -> Vec<Entry> {
+/// Forget the saved layout (Restore all, monitor set changed).
+pub fn clear_state() {
+    write_state(&State::default(), &[]);
+}
+
+pub fn read_layout() -> Layout {
     let text = std::fs::read_to_string(state_path()).unwrap_or_default();
-    let (entries, bad) = core::parse(&text);
+    let (layout, bad) = core::parse(&text);
     for line in bad {
         log!("state file: skipped {line:?}");
     }
-    entries
+    layout
 }
 
-/// Show everything the state file lists, then clear it. Safe to call repeatedly.
-pub fn restore_from_file() {
-    let entries = read_state();
+/// Show everything the state file lists, keeping the file so the next start can take
+/// the windows back. Safe to call repeatedly; used by the panic hook and failed starts.
+pub fn show_from_file() {
+    let entries: Vec<Entry> = read_layout().windows.into_iter().map(|(_, _, e)| e).collect();
     if !entries.is_empty() {
         show(&entries);
     }
-    write_state(&[]);
+}
+
+/// Startup: is a saved window still there, still the same app, and (judged by its root
+/// owner, so dialogs go with their app) on the monitor it was saved on?
+pub fn check(monitor: &str, e: &Entry) -> Check {
+    let h = hwnd(e.id);
+    unsafe {
+        if !IsWindow(Some(h)).as_bool() || !core::should_restore(e, pid_of(h), &class_of(h)) {
+            return Check::Gone;
+        }
+        let live = entry(h);
+        let root = GetAncestor(h, GA_ROOTOWNER);
+        match monitor_of(root, MONITOR_DEFAULTTONULL).map(monitor_name) {
+            Some(m) if m == monitor => Check::Here(live),
+            _ => Check::Elsewhere(live),
+        }
+    }
 }

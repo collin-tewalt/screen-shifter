@@ -8,7 +8,7 @@ mod anim;
 mod hooks;
 mod panel;
 
-use crate::core::{Dir, Entry, Plan, SLOTS};
+use crate::core::{Dir, Entry, MoveResult, Plan, Tagged, Target};
 use std::sync::atomic::Ordering::SeqCst;
 use std::thread::JoinHandle;
 use std::cell::{Cell, RefCell};
@@ -48,13 +48,14 @@ const ANIM_TIMER_MS: u32 = 250;
 thread_local! {
     static STATE: RefCell<core::State> = RefCell::default();
     static OSD: Cell<HWND> = Cell::new(HWND::default());
-    static OSD_SLOT: Cell<usize> = const { Cell::new(1) };
+    /// (slot, count) shown by the indicator
+    static OSD_SLOT: Cell<(usize, usize)> = const { Cell::new((1, 1)) };
     static HOOKS: RefCell<Option<JoinHandle<()>>> = const { RefCell::new(None) };
     static WHEEL: Cell<i32> = const { Cell::new(0) };
     /// (time of last tilt event, direction) for one-switch-per-tilt bursts
     static TILT: Cell<(u64, i32)> = const { Cell::new((0, 0)) };
     /// Panel hit at left-down (for click-to-jump): Some(None) = panel gap
-    static PRESSED: RefCell<Option<Option<(String, usize)>>> = const { RefCell::new(None) };
+    static PRESSED: RefCell<Option<Option<(String, Target)>>> = const { RefCell::new(None) };
     /// Window being dragged: its monitor and root + owned entries
     static DRAGGING: RefCell<Option<(String, Vec<Entry>)>> = const { RefCell::new(None) };
     /// A modal loop (tray menu) is running: our frame loop can't step animations.
@@ -78,23 +79,24 @@ fn main() {
 
         // The state file is written before anything is hidden, so it is always the
         // authoritative recovery source. Never touch STATE here: it may be borrowed.
+        // The file is kept: the next start takes the windows back into their slots.
         let default_hook = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {
-            win::restore_from_file();
+            win::show_from_file();
             default_hook(info);
         }));
 
-        win::restore_from_file();
-        STATE.with(|s| s.borrow_mut().reset_if_monitors_changed(&win::monitor_names()));
-
         let app = create_windows();
         if let Err(msg) = register_hotkeys(app) {
+            win::show_from_file(); // never leave saved windows hidden with no app running
             MessageBoxW(None, &windows::core::HSTRING::from(msg), w!("screen-shifter"), MB_ICONERROR);
             return;
         }
         TASKBAR_CREATED.store(RegisterWindowMessageW(w!("TaskbarCreated")), Ordering::Relaxed);
         tray(app, NIM_ADD);
         HOOKS.with(|h| *h.borrow_mut() = Some(hooks::start(app)));
+        // Only now that nothing can fail: take back the saved layout.
+        adopt_saved_layout();
         log!("running");
 
         message_loop();
@@ -187,8 +189,32 @@ unsafe fn tray(app: HWND, op: NOTIFY_ICON_MESSAGE) {
     let _ = unsafe { Shell_NotifyIconW(op, &nid) };
 }
 
+/// Startup (design §6): take back windows saved in hidden slots, show the rest. Done like
+/// a switch: write-ahead (everything to show or hide is recorded), act, then the exact state.
+fn adopt_saved_layout() {
+    let names = win::monitor_names();
+    let (state, show) = core::adopt(&win::read_layout(), win::boot_time(), &names, win::check);
+    let adopted = state.hidden();
+    win::write_state(&state, &show);
+    let show: Vec<Entry> = show.into_iter().map(|(_, _, e)| e).collect();
+    win::show(&show);
+    let focused = win::has_focus(&adopted);
+    win::hide(&adopted);
+    if focused {
+        win::focus_after_switch(&[], &adopted);
+    }
+    win::write_state(&state, &[]);
+    log!("startup: took back {}, showed {}", adopted.len(), show.len());
+    STATE.with(|s| *s.borrow_mut() = state);
+}
+
+/// Saves the current state; `extra` = windows about to be shown (write-ahead).
+fn persist(extra: &[Tagged]) {
+    STATE.with(|s| win::write_state(&s.borrow(), extra));
+}
+
 fn on_switch(monitor: String, dir: Dir) {
-    run_switch(monitor, |s, m, visible, now| s.switch(m, dir, visible, now));
+    run_switch(monitor, dir, |s, m, visible, now| s.switch(m, dir, visible, now));
 }
 
 /// Hook-driven switches pick the monitor from the posted point, not a fresh cursor read.
@@ -196,8 +222,14 @@ fn switch_at(pt: POINT, dir: Dir) {
     on_switch(win::monitor_at(pt).0, dir);
 }
 
-fn jump(monitor: String, slot: usize) {
-    run_switch(monitor, |s, m, visible, now| s.switch_to(m, slot, visible, now));
+fn jump(monitor: String, target: Target) {
+    let active = STATE.with(|s| s.borrow().active(&monitor)) - 1;
+    // Slot numbers can't tell the direction once empty slots are removed; the request can.
+    let dir = match target {
+        Target::Slot(i) if i < active => Dir::Prev,
+        _ => Dir::Next,
+    };
+    run_switch(monitor, dir, |s, m, visible, now| s.switch_to(m, target, visible, now));
 }
 
 fn motion_on() -> bool {
@@ -219,30 +251,34 @@ fn raise_overlays() {
 }
 
 /// Shared switch path: write-ahead, hide, show, persist, focus, then panel or OSD.
-fn run_switch(monitor: String, pick: impl FnOnce(&mut core::State, &str, Vec<Entry>, u64) -> Plan) {
+/// `dir` is the direction the user moved, for the slide.
+fn run_switch(monitor: String, dir: Dir, pick: impl FnOnce(&mut core::State, &str, Vec<Entry>, u64) -> Option<Plan>) {
     if hooks::DRAG.load(SeqCst) {
         return; // never hide the window under a drag
     }
     let visible = win::visible_windows_on(&monitor);
+    let names = win::monitor_names();
+    let others = |s: &core::State| -> Vec<usize> { names.iter().filter(|n| **n != monitor).map(|n| s.count(n)).collect() };
     // Copy everything out so no borrow is held across Win32 calls that can re-enter.
-    let (old, plan, new, before, after) = STATE.with(|s| {
+    let result = STATE.with(|s| {
         let mut s = s.borrow_mut();
-        let before = s.active(&monitor);
+        let before = others(&s);
         let old = s.hidden();
-        let plan = pick(&mut s, &monitor, visible, win::now_ms());
-        (old, plan, s.hidden(), before, s.active(&monitor))
+        let plan = pick(&mut s, &monitor, visible, win::now_ms())?;
+        let extra = s.tag_active(&monitor, &core::leaving(&old, &s.hidden()));
+        Some((plan, extra, s.active(&monitor), s.count(&monitor), others(&s) != before))
     });
-    if before == after {
-        return; // clamped
-    }
-    log!("{monitor}: slot {before} -> {after}, hide {}, show {}", plan.hide.len(), plan.show.len());
+    let Some((plan, extra, after, count, others_changed)) = result else {
+        return; // clamped, current slot, or stale
+    };
+    log!("{monitor}: {dir:?} to slot {after} / {count}, hide {}, show {}", plan.hide.len(), plan.show.len());
     let info = win::monitors().into_iter().find(|m| m.name == monitor);
     let rect = info.as_ref().map_or(RECT::default(), |m| m.rect);
     let t_sheet = std::time::Instant::now();
     if motion_on()
         && let Some(m) = &info
     {
-        let slide = if after > before { anim::Slide::Left } else { anim::Slide::Right };
+        let slide = if dir == Dir::Next { anim::Slide::Left } else { anim::Slide::Right };
         if anim::start_sheet(&monitor, m.rect, slide, m.scale, win::now_ms()) {
             raise_overlays();
             unsafe {
@@ -255,19 +291,24 @@ fn run_switch(monitor: String, pick: impl FnOnce(&mut core::State, &str, Vec<Ent
     }
     let t = std::time::Instant::now();
     let ms = |t: std::time::Instant| t.elapsed().as_secs_f64() * 1000.0;
-    win::write_state(&core::write_ahead_set(&old, &new));
+    persist(&extra);
     let t_write = ms(t);
     win::hide(&plan.hide);
     let shown = win::show(&plan.show);
     let t_hideshow = ms(t);
-    win::write_state(&new);
+    persist(&[]);
     win::focus_after_switch(&shown, &plan.hide);
     let t_focus = ms(t);
     if panel::is_shown() {
-        // The new slot's windows are exactly the ones just shown: no need to re-enumerate.
-        panel::update(vec![panel_data_for(monitor.clone(), &plan.show)]);
+        // The new slot's windows are exactly the ones just shown: no need to re-enumerate
+        // it. Other monitors only if capturing removed one of their slots (rare).
+        let mut data = vec![panel_data_for(monitor.clone(), &plan.show)];
+        if others_changed {
+            data.extend(names.iter().filter(|n| **n != monitor).map(|n| panel_data_for(n.clone(), &win::visible_windows_on(n))));
+        }
+        panel::update(data);
     } else {
-        show_osd(after, rect);
+        show_osd(after, count, rect);
     }
     log!("  work: write-ahead {t_write:.1}, +hide/show {:.1}, +persist/focus {:.1}, +panel/osd {:.1} ms",
         t_hideshow - t_write, t_focus - t_hideshow, ms(t) - t_focus);
@@ -275,35 +316,40 @@ fn run_switch(monitor: String, pick: impl FnOnce(&mut core::State, &str, Vec<Ent
 
 enum Moved {
     Nothing,
-    Hidden,
+    /// Hidden in this slot of the target monitor.
+    Hidden(usize),
     /// Visible on another monitor, at this rect if known.
     Relocated(Option<RECT>),
 }
 
 /// Move a dragged window into a slot (design §7): write-ahead, relocate, hide, persist.
-fn do_move(entries: Vec<Entry>, from: String, to: String, slot: usize) -> Moved {
-    let (old, hide, new) = STATE.with(|s| {
+fn do_move(entries: Vec<Entry>, from: String, to: String, target: Target) -> Moved {
+    let (result, extra) = STATE.with(|s| {
         let mut s = s.borrow_mut();
         let old = s.hidden();
-        let hide = s.move_to_slot(&entries, &from, &to, slot, win::now_ms());
-        (old, hide, s.hidden())
+        let result = s.move_to_slot(&entries, &from, &to, target, win::now_ms());
+        (result, s.tag_active(&to, &core::leaving(&old, &s.hidden())))
     });
-    if from == to && !hide {
-        return Moved::Nothing; // dropped on its own monitor's current slot
+    if result == MoveResult::Rejected {
+        return Moved::Nothing; // its own monitor's current slot, or a stale tile
     }
-    log!("move {} window(s) {from} -> {to} slot {}", entries.len(), slot + 1);
+    let hide = result != MoveResult::Visible;
+    log!("move {} window(s) {from} -> {to} {result:?}", entries.len());
     let focused = win::has_focus(&entries);
-    win::write_state(&core::write_ahead_set(&old, &new));
+    persist(&extra);
     let new_rect = if from != to { win::relocate(&entries, &from, &to) } else { None };
     if hide {
         win::hide(&entries);
     }
-    win::write_state(&new);
+    persist(&[]);
     if hide && focused {
         win::focus_after_switch(&[], &entries);
     }
     panel::update(panel_data());
-    if hide { Moved::Hidden } else { Moved::Relocated(new_rect) }
+    match result {
+        MoveResult::Hidden(i) => Moved::Hidden(i),
+        _ => Moved::Relocated(new_rect),
+    }
 }
 
 /// The ghost finishes its trip: back over the window, or nowhere if motion is off.
@@ -328,7 +374,7 @@ fn titles(entries: &[Entry]) -> Vec<String> {
 /// One monitor's panel contents; `visible` = what's on screen in its current slot.
 fn panel_data_for(monitor: String, visible: &[Entry]) -> panel::PanelData {
     let (active, slots) = STATE.with(|s| s.borrow().slots(&monitor));
-    let titles = (0..SLOTS).map(|i| if i == active { titles(visible) } else { titles(&slots[i]) }).collect();
+    let titles = slots.iter().enumerate().map(|(i, s)| if i == active { titles(visible) } else { titles(s) }).collect();
     panel::PanelData { monitor, active, titles }
 }
 
@@ -404,14 +450,14 @@ fn on_lup(pt: POINT) {
     if let Some((from, entries)) = DRAGGING.with(|d| d.borrow_mut().take()) {
         hooks::DRAG.store(false, SeqCst);
         panel::set_drop(None);
-        let Some(Some((to, slot))) = panel::hit(pt) else {
+        let Some(Some((to, target))) = panel::hit(pt) else {
             soul_home(&entries);
             return;
         };
-        let tile = panel::tile_screen_rect(&to, slot);
-        match do_move(entries.clone(), from, to.clone(), slot) {
-            Moved::Hidden if motion_on() => {
-                match tile {
+        match do_move(entries.clone(), from, to.clone(), target) {
+            Moved::Hidden(slot) if motion_on() => {
+                // after do_move's panel update, so a new tile is where the panel now draws it
+                match panel::tile_screen_rect(&to, slot) {
                     // fly into the tile, shrinking to a sliver inside it
                     Some(t) => panel::ghost_fly(RECT { left: t.left + 20, top: t.top + 20, right: t.right - 20, bottom: t.bottom - 20 }),
                     None => panel::ghost_end(),
@@ -438,15 +484,22 @@ fn on_move() {
     panel::set_drop(panel::hit(pt).flatten());
 }
 
-fn restore_all() {
+/// Shows every hidden window and resets to one slot per monitor, keeping the saved layout
+/// for the next start (Exit, logoff).
+fn show_all() {
     anim::clear_all();
     let entries = STATE.with(|s| s.borrow_mut().restore_all());
     win::show(&entries);
-    win::write_state(&[]);
 }
 
-fn show_osd(slot: usize, monitor: RECT) {
-    OSD_SLOT.set(slot);
+/// Shows everything and forgets the layout.
+fn restore_all() {
+    show_all();
+    win::clear_state();
+}
+
+fn show_osd(slot: usize, count: usize, monitor: RECT) {
+    OSD_SLOT.set((slot, count));
     let osd = OSD.get();
     let (w, h) = OSD_SIZE;
     let x = (monitor.left + monitor.right - w) / 2;
@@ -478,7 +531,8 @@ unsafe extern "system" fn osd_proc(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) ->
             let old = SelectObject(dc, font.into());
             SetTextColor(dc, windows::Win32::Foundation::COLORREF(0xFFFFFF));
             SetBkMode(dc, TRANSPARENT);
-            let mut text: Vec<u16> = format!("{} / {SLOTS}", OSD_SLOT.get()).encode_utf16().collect();
+            let (slot, count) = OSD_SLOT.get();
+            let mut text: Vec<u16> = format!("{slot} / {count}").encode_utf16().collect();
             DrawTextW(dc, &mut text, &mut rc, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
             SelectObject(dc, old);
             let _ = DeleteObject(font.into());
@@ -527,7 +581,7 @@ unsafe extern "system" fn app_proc(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) ->
             hooks::WM_HOOK_LUP => on_lup(hooks::unpack(lp.0 as u64)),
             hooks::WM_HOOK_MOVE => on_move(),
             WM_QUERYENDSESSION => {
-                restore_all(); // so "save changes?" prompts are visible
+                show_all(); // so "save changes?" prompts are visible
                 return LRESULT(1);
             }
             WM_DISPLAYCHANGE => {
@@ -536,7 +590,7 @@ unsafe extern "system" fn app_proc(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) ->
                 if let Some(entries) = reset {
                     log!("monitor set changed: restoring {}", entries.len());
                     win::show(&entries);
-                    win::write_state(&[]);
+                    win::clear_state();
                 }
                 if panel::is_shown() {
                     show_panels(); // rebuild for the new layout
@@ -567,7 +621,7 @@ unsafe fn tray_menu(app: HWND) {
         match cmd.0 {
             CMD_RESTORE => restore_all(),
             CMD_EXIT => {
-                restore_all();
+                show_all(); // the next start takes them back
                 cancel_drag();
                 panel::hide();
                 if let Some(h) = HOOKS.with(|h| h.borrow_mut().take()) {
