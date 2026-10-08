@@ -22,6 +22,8 @@ Release `Ctrl+Alt` (or drop somewhere that isn't a tile) to cancel a drag. The k
 
 Without the panel up, a "2 / 4" indicator flashes on that monitor. Whatever is open on a monitor when you leave a slot belongs to that slot. Hidden windows disappear from the taskbar and Alt+Tab.
 
+Switches animate: the old slot slides off to the left when you go to a higher slot and to the right when you go lower, and quick scrolling peels sheets off back to back. A dropped window's ghost flies into its tile (which pulses), glides to its new spot on the other monitor, or springs back if you cancel. Turn animations off with Windows' own **Settings → Accessibility → Visual effects → Animation effects**.
+
 Tray icon (right-click): **Restore all windows**, **Exit**.
 
 ## Build
@@ -44,3 +46,5 @@ Hidden windows are written to `%LOCALAPPDATA%\screen-shifter\hidden.txt` *before
 - A monitor that drops out of the display list when it sleeps (common with DisplayPort) resets all slots.
 - Hotkeys are fixed; if another app owns them, screen-shifter shows an error and exits.
 - While `Ctrl+Alt` is held, left clicks and the wheel go to screen-shifter, not to apps.
+- screen-shifter's overlays (panel, indicator, animations) don't appear in screenshots or screen sharing.
+- Protected video may show as black in the sliding picture; with HDR on, the picture can look slightly dimmer than the live screen.

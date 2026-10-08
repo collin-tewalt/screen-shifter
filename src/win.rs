@@ -53,6 +53,7 @@ fn monitor_name(m: HMONITOR) -> String {
 
 pub struct MonitorInfo {
     pub name: String,
+    pub rect: RECT,
     pub work: RECT,
     /// DPI scale, 1.0 = 96 dpi
     pub scale: f32,
@@ -65,6 +66,7 @@ pub fn monitors() -> Vec<MonitorInfo> {
             let _ = GetDpiForMonitor(m, MDT_EFFECTIVE_DPI, &mut dx, &mut dy);
             (*(lp.0 as *mut Vec<MonitorInfo>)).push(MonitorInfo {
                 name: monitor_name(m),
+                rect: monitor_info(m).monitorInfo.rcMonitor,
                 work: monitor_info(m).monitorInfo.rcWork,
                 scale: dx as f32 / 96.0,
             });
@@ -332,11 +334,13 @@ fn set_placement_async(h: HWND, p: &mut WINDOWPLACEMENT) {
 }
 
 /// Move windows from one monitor to another, keeping their position relative to the work area.
-pub fn relocate(entries: &[Entry], from: &str, to: &str) {
+/// Returns where the root window will appear (screen coordinates), for the soul to fly to.
+pub fn relocate(entries: &[Entry], from: &str, to: &str) -> Option<RECT> {
     let mons = monitors();
     let work = |name: &str| mons.iter().find(|m| m.name == name).map(|m| m.work);
-    let (Some(a), Some(b)) = (work(from), work(to)) else { return };
+    let (Some(a), Some(b)) = (work(from), work(to)) else { return None };
     let pwa = primary_work_area();
+    let mut root_rect = None;
     for e in entries {
         let h = hwnd(e.id);
         if unsafe { IsHungAppWindow(h).as_bool() } {
@@ -349,8 +353,21 @@ pub fn relocate(entries: &[Entry], from: &str, to: &str) {
         let left = (r.left + b.left - a.left).clamp(b.left - pwa.left, b.right - pwa.left - w);
         let top = (r.top + b.top - a.top).clamp(b.top - pwa.top, b.bottom - pwa.top - ht);
         p.rcNormalPosition = RECT { left, top, right: left + w, bottom: top + ht };
+        if is_root(e.id) {
+            root_rect = Some(if unsafe { IsZoomed(h).as_bool() } {
+                b
+            } else {
+                RECT { left: left + pwa.left, top: top + pwa.top, right: left + w + pwa.left, bottom: top + ht + pwa.top }
+            });
+        }
         set_placement_async(h, &mut p);
     }
+    root_rect
+}
+
+pub fn window_rect(id: u64) -> Option<RECT> {
+    let mut r = RECT::default();
+    unsafe { GetWindowRect(hwnd(id), &mut r) }.ok().map(|_| r)
 }
 
 /// Keystrokes must never go to a hidden window.

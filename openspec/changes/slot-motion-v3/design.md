@@ -85,7 +85,11 @@ Per switch: one capture (~5–15 ms at 1440p–4K) + ≤ 1 frame wait (step 3) b
 - [Capture fails (secure desktop, UAC, lock screen)] → `BitBlt` failure skips the sheet; the switch happens without motion.
 - [Ctrl+Alt+click during a slide] → grabs the live window under the picture (clicks pass through sheets), not the one drawn on it. Accepted; documented.
 
+## Spike Findings
+
+- 1.1: `WDA_EXCLUDEFROMCAPTURE` **is honored by GDI `BitBlt`** from the screen DC, for both normal and layered windows (our pixel read back the desktop, not the overlay). Chaining and overlay exclusion use the main path; the fallbacks are not needed.
+- 1.2 (2560×1440 ×2, dev machine): full-monitor `BitBlt` capture ≈ 27–30 ms; forcing alpha on the frame ≈ 1 ms; `UpdateLayeredWindow` of a half-monitor sheet ≈ 3.5 ms per frame. So a switch gains ~30 ms + ≤ 1 frame before hides start; per-frame cost is comfortably under a 60 Hz budget.
+
 ## Open Questions
 
-- Does `WDA_EXCLUDEFROMCAPTURE` apply to GDI `BitBlt` from the screen DC? (Spike 1.1; fallback in §4.)
 - Is 220 ms the right feel? Tune after use.

@@ -4,6 +4,7 @@
 mod core;
 #[macro_use]
 mod win;
+mod anim;
 mod hooks;
 mod panel;
 
@@ -15,6 +16,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use windows::Win32::Foundation::{
     ERROR_ALREADY_EXISTS, GetLastError, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM,
 };
+use windows::Win32::Graphics::Dwm::DwmFlush;
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::System::Threading::CreateMutexW;
@@ -39,6 +41,9 @@ const PANEL_TIMER: usize = 2;
 const PANEL_DELAY_MS: u32 = 250;
 const TILT_GAP_MS: u64 = 400;
 const WHEEL_NOTCH: i32 = 120;
+/// Backstop for the animation hard limit; WM_TIMER still arrives inside modal loops.
+const ANIM_TIMER: usize = 3;
+const ANIM_TIMER_MS: u32 = 250;
 
 thread_local! {
     static STATE: RefCell<core::State> = RefCell::default();
@@ -52,6 +57,9 @@ thread_local! {
     static PRESSED: RefCell<Option<Option<(String, usize)>>> = const { RefCell::new(None) };
     /// Window being dragged: its monitor and root + owned entries
     static DRAGGING: RefCell<Option<(String, Vec<Entry>)>> = const { RefCell::new(None) };
+    /// A modal loop (tray menu) is running: our frame loop can't step animations.
+    static MODAL: Cell<bool> = const { Cell::new(false) };
+    static APP: Cell<HWND> = Cell::new(HWND::default());
 }
 static TASKBAR_CREATED: AtomicU32 = AtomicU32::new(0);
 
@@ -89,10 +97,40 @@ fn main() {
         HOOKS.with(|h| *h.borrow_mut() = Some(hooks::start(app)));
         log!("running");
 
-        let mut msg = MSG::default();
-        while GetMessageW(&mut msg, None, 0, 0).as_bool() {
-            let _ = TranslateMessage(&msg);
-            DispatchMessageW(&msg);
+        message_loop();
+    }
+}
+
+/// Blocks in GetMessage when idle; while anything animates, drains messages, steps one
+/// frame, and paces itself to the display with DwmFlush. Never nested inside a wndproc.
+fn message_loop() {
+    let mut msg = MSG::default();
+    unsafe {
+        loop {
+            if anim::active() || panel::step(win::now_ms()) {
+                while PeekMessageW(&mut msg, None, 0, 0, PM_REMOVE).as_bool() {
+                    if msg.message == WM_QUIT {
+                        return;
+                    }
+                    let _ = TranslateMessage(&msg);
+                    DispatchMessageW(&msg);
+                }
+                let now = win::now_ms();
+                anim::step(now);
+                panel::step(now);
+                let t = std::time::Instant::now();
+                let _ = DwmFlush();
+                if t.elapsed() < std::time::Duration::from_millis(1) {
+                    std::thread::sleep(std::time::Duration::from_millis(1)); // nothing composed: don't spin
+                }
+                anim::frame_composed();
+            } else {
+                if !GetMessageW(&mut msg, None, 0, 0).as_bool() {
+                    return;
+                }
+                let _ = TranslateMessage(&msg);
+                DispatchMessageW(&msg);
+            }
         }
     }
 }
@@ -114,7 +152,9 @@ unsafe fn create_windows() -> HWND {
             WS_POPUP,
         );
         let _ = SetLayeredWindowAttributes(osd, Default::default(), 220, LWA_ALPHA);
+        anim::exclude_from_capture(osd);
         OSD.set(osd);
+        APP.set(app);
         app
     }
 }
@@ -147,26 +187,39 @@ unsafe fn tray(app: HWND, op: NOTIFY_ICON_MESSAGE) {
     let _ = unsafe { Shell_NotifyIconW(op, &nid) };
 }
 
-fn on_switch(monitor: String, rect: RECT, dir: Dir) {
-    run_switch(monitor, rect, |s, m, visible, now| s.switch(m, dir, visible, now));
+fn on_switch(monitor: String, dir: Dir) {
+    run_switch(monitor, |s, m, visible, now| s.switch(m, dir, visible, now));
 }
 
 /// Hook-driven switches pick the monitor from the posted point, not a fresh cursor read.
 fn switch_at(pt: POINT, dir: Dir) {
-    let (monitor, rect) = win::monitor_at(pt);
-    on_switch(monitor, rect, dir);
+    on_switch(win::monitor_at(pt).0, dir);
 }
 
 fn jump(monitor: String, slot: usize) {
-    run_switch(monitor, RECT::default(), |s, m, visible, now| s.switch_to(m, slot, visible, now));
+    run_switch(monitor, |s, m, visible, now| s.switch_to(m, slot, visible, now));
+}
+
+fn motion_on() -> bool {
+    !MODAL.get() && anim::enabled()
+}
+
+/// Keeps panels, OSD, and ghost above a sheet that was just created.
+fn raise_overlays() {
+    let mut overlays = panel::overlay_hwnds();
+    let osd = OSD.get();
+    if unsafe { IsWindowVisible(osd).as_bool() } {
+        overlays.push(osd);
+    }
+    for h in overlays {
+        unsafe {
+            let _ = SetWindowPos(h, Some(HWND_TOPMOST), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        }
+    }
 }
 
 /// Shared switch path: write-ahead, hide, show, persist, focus, then panel or OSD.
-fn run_switch(
-    monitor: String,
-    rect: RECT,
-    pick: impl FnOnce(&mut core::State, &str, Vec<Entry>, u64) -> Plan,
-) {
+fn run_switch(monitor: String, pick: impl FnOnce(&mut core::State, &str, Vec<Entry>, u64) -> Plan) {
     if hooks::DRAG.load(SeqCst) {
         return; // never hide the window under a drag
     }
@@ -183,6 +236,21 @@ fn run_switch(
         return; // clamped
     }
     log!("{monitor}: slot {before} -> {after}, hide {}, show {}", plan.hide.len(), plan.show.len());
+    let info = win::monitors().into_iter().find(|m| m.name == monitor);
+    let rect = info.as_ref().map_or(RECT::default(), |m| m.rect);
+    if motion_on()
+        && let Some(m) = &info
+    {
+        let slide = if after > before { anim::Slide::Left } else { anim::Slide::Right };
+        if anim::start_sheet(&monitor, m.rect, slide, m.scale, win::now_ms()) {
+            raise_overlays();
+            unsafe {
+                // the sheet must be on screen before anything underneath changes
+                let _ = DwmFlush();
+                SetTimer(Some(APP.get()), ANIM_TIMER, ANIM_TIMER_MS, None);
+            }
+        }
+    }
     win::write_state(&core::write_ahead_set(&old, &new));
     win::hide(&plan.hide);
     let shown = win::show(&plan.show);
@@ -195,8 +263,15 @@ fn run_switch(
     }
 }
 
+enum Moved {
+    Nothing,
+    Hidden,
+    /// Visible on another monitor, at this rect if known.
+    Relocated(Option<RECT>),
+}
+
 /// Move a dragged window into a slot (design §7): write-ahead, relocate, hide, persist.
-fn do_move(entries: Vec<Entry>, from: String, to: String, slot: usize) {
+fn do_move(entries: Vec<Entry>, from: String, to: String, slot: usize) -> Moved {
     let (old, hide, new) = STATE.with(|s| {
         let mut s = s.borrow_mut();
         let old = s.hidden();
@@ -204,14 +279,12 @@ fn do_move(entries: Vec<Entry>, from: String, to: String, slot: usize) {
         (old, hide, s.hidden())
     });
     if from == to && !hide {
-        return; // dropped on its own monitor's current slot
+        return Moved::Nothing; // dropped on its own monitor's current slot
     }
     log!("move {} window(s) {from} -> {to} slot {}", entries.len(), slot + 1);
     let focused = win::has_focus(&entries);
     win::write_state(&core::write_ahead_set(&old, &new));
-    if from != to {
-        win::relocate(&entries, &from, &to);
-    }
+    let new_rect = if from != to { win::relocate(&entries, &from, &to) } else { None };
     if hide {
         win::hide(&entries);
     }
@@ -220,6 +293,16 @@ fn do_move(entries: Vec<Entry>, from: String, to: String, slot: usize) {
         win::focus_after_switch(&[], &entries);
     }
     panel::update(panel_data());
+    if hide { Moved::Hidden } else { Moved::Relocated(new_rect) }
+}
+
+/// The ghost finishes its trip: back over the window, or nowhere if motion is off.
+fn soul_home(entries: &[Entry]) {
+    let root = entries.iter().find(|e| win::is_root(e.id)).or(entries.first());
+    match root.and_then(|e| win::window_rect(e.id)) {
+        Some(r) if motion_on() => panel::ghost_fly(r),
+        _ => panel::ghost_end(),
+    }
 }
 
 /// Titles per slot for every monitor. Owned dialogs are left out of the lists.
@@ -250,10 +333,10 @@ fn show_panels() {
 }
 
 fn cancel_drag() {
-    if DRAGGING.with(|d| d.borrow_mut().take()).is_some() {
+    if let Some((_, entries)) = DRAGGING.with(|d| d.borrow_mut().take()) {
         hooks::DRAG.store(false, SeqCst);
-        panel::ghost_end();
         panel::set_drop(None);
+        soul_home(&entries);
     }
 }
 
@@ -298,16 +381,31 @@ fn on_ldown(pt: POINT) {
     log!("drag start {:x} on {monitor}", root);
     hooks::DRAG.store(true, SeqCst);
     DRAGGING.with(|d| *d.borrow_mut() = Some((monitor, entries)));
+    anim::clear_all(); // PrintWindow below can be slow; never leave a sheet frozen mid-slide
     panel::ghost_start(win::hwnd(root), pt);
 }
 
 fn on_lup(pt: POINT) {
     if let Some((from, entries)) = DRAGGING.with(|d| d.borrow_mut().take()) {
         hooks::DRAG.store(false, SeqCst);
-        panel::ghost_end();
         panel::set_drop(None);
-        if let Some(Some((to, slot))) = panel::hit(pt) {
-            do_move(entries, from, to, slot);
+        let Some(Some((to, slot))) = panel::hit(pt) else {
+            soul_home(&entries);
+            return;
+        };
+        let tile = panel::tile_screen_rect(&to, slot);
+        match do_move(entries.clone(), from, to.clone(), slot) {
+            Moved::Hidden if motion_on() => {
+                match tile {
+                    // fly into the tile, shrinking to a sliver inside it
+                    Some(t) => panel::ghost_fly(RECT { left: t.left + 20, top: t.top + 20, right: t.right - 20, bottom: t.bottom - 20 }),
+                    None => panel::ghost_end(),
+                }
+                panel::pulse(&to, slot);
+            }
+            Moved::Relocated(Some(r)) if motion_on() => panel::ghost_fly(r),
+            Moved::Nothing => soul_home(&entries),
+            _ => panel::ghost_end(),
         }
         return;
     }
@@ -326,6 +424,7 @@ fn on_move() {
 }
 
 fn restore_all() {
+    anim::clear_all();
     let entries = STATE.with(|s| s.borrow_mut().restore_all());
     win::show(&entries);
     win::write_state(&[]);
@@ -379,20 +478,20 @@ unsafe extern "system" fn app_proc(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) ->
     unsafe {
         match msg {
             WM_HOTKEY => match wp.0 as i32 {
-                HK_PREV => {
-                    let (m, r) = win::cursor_monitor();
-                    on_switch(m, r, Dir::Prev);
-                }
-                HK_NEXT => {
-                    let (m, r) = win::cursor_monitor();
-                    on_switch(m, r, Dir::Next);
-                }
+                HK_PREV => on_switch(win::cursor_monitor().0, Dir::Prev),
+                HK_NEXT => on_switch(win::cursor_monitor().0, Dir::Next),
                 HK_PANIC => panic!("debug panic drill"),
                 _ => {}
             },
             WM_TRAY if matches!(lp.0 as u32, WM_RBUTTONUP | WM_CONTEXTMENU) => tray_menu(h),
             hooks::WM_CHORD_DOWN => {
                 SetTimer(Some(h), PANEL_TIMER, PANEL_DELAY_MS, None);
+            }
+            WM_TIMER if wp.0 == ANIM_TIMER => {
+                anim::enforce_limit(win::now_ms());
+                if !anim::active() {
+                    let _ = KillTimer(Some(h), ANIM_TIMER);
+                }
             }
             WM_TIMER if wp.0 == PANEL_TIMER => {
                 let _ = KillTimer(Some(h), PANEL_TIMER);
@@ -417,6 +516,7 @@ unsafe extern "system" fn app_proc(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) ->
                 return LRESULT(1);
             }
             WM_DISPLAYCHANGE => {
+                anim::clear_all();
                 let reset = STATE.with(|s| s.borrow_mut().reset_if_monitors_changed(&win::monitor_names()));
                 if let Some(entries) = reset {
                     log!("monitor set changed: restoring {}", entries.len());
@@ -443,7 +543,11 @@ unsafe fn tray_menu(app: HWND) {
         let mut pt = Default::default();
         let _ = GetCursorPos(&mut pt);
         let _ = SetForegroundWindow(app); // required for the menu to close on outside click
+        // The menu runs its own modal loop, so our frame loop can't advance sheets meanwhile.
+        anim::clear_all();
+        MODAL.set(true);
         let cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_NONOTIFY, pt.x, pt.y, None, app, None);
+        MODAL.set(false);
         let _ = DestroyMenu(menu);
         match cmd.0 {
             CMD_RESTORE => restore_all(),

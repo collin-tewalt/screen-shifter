@@ -1,8 +1,9 @@
 //! Overlay windows: a slot panel per monitor and the drag ghost.
 //! Display only: they never take focus or clicks. All input arrives through the hooks.
 
+use crate::anim::{self, ease_out};
 use crate::core::SLOTS;
-use crate::win::MonitorInfo;
+use crate::win::{self, MonitorInfo};
 use std::cell::{Cell, RefCell};
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM};
 use windows::Win32::Graphics::Gdi::*;
@@ -25,11 +26,34 @@ struct Panel {
     scale: f32,
 }
 
+/// The ghost's scaled snapshot, kept after the drag so the soul can fly with it.
+struct Snap {
+    dc: HDC,
+    bmp: HBITMAP,
+    old: HGDIOBJ,
+    w: i32,
+    h: i32,
+}
+
+struct Flight {
+    from: RECT,
+    to: RECT,
+    start: u64,
+}
+
 thread_local! {
     static PANELS: RefCell<Vec<Panel>> = const { RefCell::new(Vec::new()) };
     static DROP: RefCell<Option<(String, usize)>> = const { RefCell::new(None) };
     static GHOST: Cell<HWND> = Cell::new(HWND::default());
+    static SNAP: RefCell<Option<Snap>> = const { RefCell::new(None) };
+    static FLIGHT: RefCell<Option<Flight>> = const { RefCell::new(None) };
+    /// (monitor, slot, start) of a tile that just received a window
+    static PULSE: RefCell<Option<(String, usize, u64)>> = const { RefCell::new(None) };
 }
+
+const FLY_MS: u64 = 180;
+const PULSE_MS: u64 = 300;
+const GHOST_ALPHA: u8 = 150;
 
 const TILE: (i32, i32) = (220, 150);
 const GAP: i32 = 12;
@@ -96,6 +120,7 @@ pub fn show(monitors: &[MonitorInfo], mut data: Vec<PanelData>) {
         let top = m.work.bottom - h - px(48, s);
         let rect = RECT { left, top, right: left + w, bottom: top + h };
         let hwnd = overlay(cls, rect);
+        anim::exclude_from_capture(hwnd);
         unsafe {
             let _ = SetLayeredWindowAttributes(hwnd, COLORREF(0), 235, LWA_ALPHA);
         }
@@ -148,6 +173,121 @@ pub fn hit(pt: POINT) -> Option<Option<(String, usize)>> {
     })
 }
 
+/// Screen rect of a tile, for the soul to fly into.
+pub fn tile_screen_rect(monitor: &str, slot: usize) -> Option<RECT> {
+    PANELS.with(|p| {
+        let p = p.borrow();
+        let panel = p.iter().find(|p| p.data.monitor == monitor)?;
+        let r = tile_rect(slot, panel.scale);
+        let (dx, dy) = (panel.rect.left, panel.rect.top);
+        Some(RECT { left: r.left + dx, top: r.top + dy, right: r.right + dx, bottom: r.bottom + dy })
+    })
+}
+
+/// Every visible overlay that must stay above switch sheets.
+pub fn overlay_hwnds() -> Vec<HWND> {
+    let mut v: Vec<HWND> = PANELS.with(|p| p.borrow().iter().map(|p| p.hwnd).collect());
+    let ghost = GHOST.get();
+    if unsafe { IsWindowVisible(ghost).as_bool() } {
+        v.push(ghost);
+    }
+    v
+}
+
+pub fn pulse(monitor: &str, slot: usize) {
+    PULSE.with(|p| *p.borrow_mut() = Some((monitor.to_string(), slot, win::now_ms())));
+    invalidate_all();
+}
+
+fn invalidate_all() {
+    PANELS.with(|p| {
+        for panel in p.borrow().iter() {
+            unsafe {
+                let _ = InvalidateRect(Some(panel.hwnd), None, false);
+            }
+        }
+    });
+}
+
+/// Advances the soul's flight and the tile pulse. True while either is running.
+pub fn step(now: u64) -> bool {
+    let flying = FLIGHT.with(|f| f.borrow().as_ref().map(|f| (f.from, f.to, f.start)));
+    if let Some((from, to, start)) = flying {
+        let t = (now.saturating_sub(start) as f32 / FLY_MS as f32).min(1.0);
+        if t >= 1.0 {
+            ghost_end();
+        } else {
+            let e = ease_out(t);
+            let lerp = |a: i32, b: i32| a + ((b - a) as f32 * e) as i32;
+            let r = RECT { left: lerp(from.left, to.left), top: lerp(from.top, to.top), right: lerp(from.right, to.right), bottom: lerp(from.bottom, to.bottom) };
+            render_ghost(r, (GHOST_ALPHA as f32 * (1.0 - e)) as u8);
+        }
+    }
+    // (still pulsing, pulse just ended): repaint during the pulse and once after it
+    let (pulsing, ended) = PULSE.with(|p| {
+        let mut p = p.borrow_mut();
+        match &*p {
+            Some((_, _, start)) if now.saturating_sub(*start) < PULSE_MS => (true, false),
+            Some(_) => {
+                *p = None;
+                (false, true)
+            }
+            None => (false, false),
+        }
+    });
+    if pulsing || ended {
+        invalidate_all();
+    }
+    FLIGHT.with(|f| f.borrow().is_some()) || pulsing
+}
+
+/// Lets the ghost finish its trip: glide and scale to `to`, fading out.
+pub fn ghost_fly(to: RECT) {
+    let ghost = GHOST.get();
+    let mut from = RECT::default();
+    unsafe {
+        let _ = GetWindowRect(ghost, &mut from);
+    }
+    if SNAP.with(|s| s.borrow().is_none()) {
+        ghost_end();
+        return;
+    }
+    FLIGHT.with(|f| *f.borrow_mut() = Some(Flight { from, to, start: win::now_ms() }));
+}
+
+fn render_ghost(r: RECT, alpha: u8) {
+    let (w, h) = ((r.right - r.left).max(1), (r.bottom - r.top).max(1));
+    SNAP.with(|s| {
+        let s = s.borrow();
+        let Some(snap) = s.as_ref() else { return };
+        unsafe {
+            let screen = GetDC(None);
+            let dc = CreateCompatibleDC(Some(screen));
+            let bmp = CreateCompatibleBitmap(screen, w, h);
+            let old = SelectObject(dc, bmp.into());
+            SetStretchBltMode(dc, HALFTONE);
+            let _ = StretchBlt(dc, 0, 0, w, h, Some(snap.dc), 0, 0, snap.w, snap.h, SRCCOPY);
+            let blend = BLENDFUNCTION { BlendOp: AC_SRC_OVER as u8, BlendFlags: 0, SourceConstantAlpha: alpha, AlphaFormat: 0 };
+            let _ = UpdateLayeredWindow(GHOST.get(), Some(screen), Some(&POINT { x: r.left, y: r.top }), Some(&SIZE { cx: w, cy: h }),
+                Some(dc), Some(&POINT::default()), COLORREF(0), Some(&blend), ULW_ALPHA);
+            SelectObject(dc, old);
+            let _ = DeleteObject(bmp.into());
+            let _ = DeleteDC(dc);
+            ReleaseDC(None, screen);
+        }
+    });
+}
+
+fn drop_snap() {
+    if let Some(s) = SNAP.with(|s| s.borrow_mut().take()) {
+        unsafe {
+            SelectObject(s.dc, s.old);
+            let _ = DeleteObject(s.bmp.into());
+            let _ = DeleteDC(s.dc);
+        }
+    }
+}
+
 pub fn set_drop(target: Option<(String, usize)>) {
     let changed = DROP.with(|d| d.replace(target.clone()) != target);
     if changed {
@@ -175,6 +315,15 @@ unsafe fn text(dc: HDC, s: &str, r: &mut RECT, color: COLORREF, flags: DRAW_TEXT
         let mut w: Vec<u16> = s.encode_utf16().collect();
         DrawTextW(dc, &mut w, r, flags | DT_SINGLELINE | DT_NOPREFIX | DT_END_ELLIPSIS);
     }
+}
+
+/// Blend two COLORREFs, `k` = 0 → a, 1 → b.
+fn mix(a: COLORREF, b: COLORREF, k: f32) -> COLORREF {
+    let ch = |shift: u32| {
+        let (x, y) = (((a.0 >> shift) & 0xFF) as f32, ((b.0 >> shift) & 0xFF) as f32);
+        ((x + (y - x) * k) as u32) << shift
+    };
+    COLORREF(ch(0) | ch(8) | ch(16))
 }
 
 fn font(height: i32, weight: i32) -> HFONT {
@@ -209,7 +358,14 @@ unsafe fn paint(h: HWND) {
                 } else {
                     r
                 };
-                fill(dc, &inner, if is_drop { DROP_BG } else { TILE_BG });
+                let pulse = PULSE.with(|p| match &*p.borrow() {
+                    Some((m, t, start)) if *m == panel.data.monitor && *t == i => {
+                        1.0 - (win::now_ms().saturating_sub(*start) as f32 / PULSE_MS as f32).min(1.0)
+                    }
+                    _ => 0.0,
+                });
+                let base = if is_drop { DROP_BG } else { TILE_BG };
+                fill(dc, &inner, if pulse > 0.0 { mix(base, ACCENT, pulse) } else { base });
                 let pad = px(10, s);
                 let line = px(20, s);
                 let old = SelectObject(dc, big.into());
@@ -267,8 +423,11 @@ pub fn ghost_start(src: HWND, pt: POINT) -> bool {
         if w <= 0 || h <= 0 {
             return false;
         }
+        ghost_end(); // a soul still flying from the last drop
         if GHOST.get().is_invalid() {
-            GHOST.set(overlay(class(w!("ScreenShifterGhost"), Some(ghost_proc)), RECT::default()));
+            let g = overlay(class(w!("ScreenShifterGhost"), Some(ghost_proc)), RECT::default());
+            anim::exclude_from_capture(g);
+            GHOST.set(g);
         }
         let ghost = GHOST.get();
 
@@ -296,11 +455,10 @@ pub fn ghost_start(src: HWND, pt: POINT) -> bool {
         let ok = UpdateLayeredWindow(ghost, Some(screen), Some(&pos), Some(&SIZE { cx: sw, cy: sh }),
             Some(small_dc), Some(&POINT::default()), COLORREF(0), Some(&blend), ULW_ALPHA).is_ok();
 
-        SelectObject(small_dc, old_small);
+        // keep the small snapshot for the soul's flight after the drop
+        SNAP.with(|s| *s.borrow_mut() = Some(Snap { dc: small_dc, bmp: small, old: old_small, w: sw, h: sh }));
         SelectObject(full_dc, old_full);
-        let _ = DeleteObject(small.into());
         let _ = DeleteObject(full.into());
-        let _ = DeleteDC(small_dc);
         let _ = DeleteDC(full_dc);
         ReleaseDC(None, screen);
 
@@ -327,6 +485,8 @@ pub fn ghost_move(pt: POINT) {
 }
 
 pub fn ghost_end() {
+    FLIGHT.with(|f| f.borrow_mut().take());
+    drop_snap();
     unsafe {
         let _ = ShowWindow(GHOST.get(), SW_HIDE);
     }
