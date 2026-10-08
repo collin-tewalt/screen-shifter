@@ -1,17 +1,20 @@
 [package]
 name = "screen-shifter"
-version = "0.1.0"
+version = "0.5.0"
 edition = "2024"
 
 [dependencies.windows]
 version = "0.62.2"
 features = [
+    "ApplicationModel",
     "Win32_Foundation",
     "Win32_Graphics_Dwm",
     "Win32_Graphics_Gdi",
     "Win32_Security",
+    "Win32_Storage_Packaging_Appx",
     "Win32_Storage_Xps",
     "Win32_System_LibraryLoader",
+    "Win32_System_Recovery",
     "Win32_System_SystemInformation",
     "Win32_System_Threading",
     "Win32_UI_HiDpi",

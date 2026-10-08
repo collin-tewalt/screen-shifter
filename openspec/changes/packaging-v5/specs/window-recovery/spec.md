@@ -33,23 +33,23 @@ The system SHALL show a notification-area icon whose context menu offers "Restor
 ## ADDED Requirements
 
 ### Requirement: Closed by Windows for an update or uninstall
-When Windows asks the app to close (to update or remove its package, to end the session, or with a close request to its window), the system SHALL show every hidden window, keep the saved layout, and exit cleanly. It SHALL register to be relaunched after being closed for an update, where Windows supports that; the next launch, automatic or not, takes the saved windows back into their slots. The restart registration MUST NOT relaunch the app after a crash or a reboot.
+When Windows asks the app to close (to update or remove its package, to end the session, or with a close request to its window), the system SHALL show every hidden window, keep the saved layout, and exit cleanly. It SHALL register to be relaunched after being closed for an update; the relaunched app takes the saved windows back into their slots. The restart registration MUST NOT relaunch the app after a crash or a reboot.
 
 #### Scenario: Update while windows are hidden
 - **WHEN** windows are hidden in slots and a newer version of the package is installed while the app runs
-- **THEN** either the update waits until the app exits, or the windows become visible before the app closes; when the new version starts (by itself if Windows relaunches it, else at the next launch or sign-in) any of those windows that still exist return to their slots (unless Windows restarted in between)
+- **THEN** either the update is refused until the app exits (the windows stay in their slots), or the windows become visible, the app closes, the new version starts by itself, and the windows return to their slots (unless Windows restarted in between)
 
 #### Scenario: Close request
-- **WHEN** windows are hidden in slots and something sends the app's window a close request (e.g. `taskkill` without `/f`)
+- **WHEN** windows are hidden in slots and something sends the app's window a close request (`WM_CLOSE`)
 - **THEN** the windows become visible and the app exits
 
 #### Scenario: Uninstall while windows are hidden
-- **WHEN** windows are hidden in slots and Windows asks the app to close before removing the package
+- **WHEN** windows are hidden in slots and the package is uninstalled while the app runs (from Settings or PowerShell)
 - **THEN** all those windows are visible after the app is gone
 
 #### Scenario: Stopped without being asked
-- **WHEN** the app is terminated without any close request (e.g. `taskkill /f`, or an uninstall that doesn't ask)
-- **THEN** its windows stay hidden until the app runs again, which takes them back; after an uninstall it never runs again, so the documentation tells users to choose Exit before uninstalling
+- **WHEN** the app is terminated without any close request (e.g. `taskkill /f`, Task Manager's End task)
+- **THEN** its windows stay hidden until the app runs again, which takes them back
 
 #### Scenario: No restart loop
 - **WHEN** the app crashes

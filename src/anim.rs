@@ -133,6 +133,9 @@ thread_local! {
 }
 
 unsafe extern "system" fn sheet_proc(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    if msg == WM_CLOSE {
+        return LRESULT(0); // only the app window decides when we close
+    }
     unsafe { DefWindowProcW(h, msg, wp, lp) }
 }
 

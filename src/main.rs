@@ -19,9 +19,11 @@ use windows::Win32::Foundation::{
 use windows::Win32::Graphics::Dwm::DwmFlush;
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows::ApplicationModel::{StartupTask, StartupTaskState};
+use windows::Win32::System::Recovery::{RESTART_NO_CRASH, RESTART_NO_HANG, RESTART_NO_REBOOT, RegisterApplicationRestart};
 use windows::Win32::System::Threading::CreateMutexW;
 use windows::Win32::UI::HiDpi::{
-    DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext,
+    DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetSystemMetricsForDpi, SetProcessDpiAwarenessContext,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::*;
 use windows::Win32::UI::Shell::*;
@@ -34,6 +36,16 @@ const HK_PANIC: i32 = 3; // debug builds only: failure drill for task 6.3
 const WM_TRAY: u32 = WM_APP + 1;
 const CMD_RESTORE: i32 = 1;
 const CMD_EXIT: i32 = 2;
+const CMD_STARTUP: i32 = 3;
+/// Must match the manifest's `desktop:StartupTask TaskId`.
+const STARTUP_TASK: &str = "ScreenShifter";
+/// Tray icon sizes we ship (`tools/make_icons.py`).
+const TRAY_ICONS: [(i32, &[u8]); 4] = [
+    (16, include_bytes!("../assets/tray-16.png")),
+    (20, include_bytes!("../assets/tray-20.png")),
+    (24, include_bytes!("../assets/tray-24.png")),
+    (32, include_bytes!("../assets/tray-32.png")),
+];
 const OSD_TIMER: usize = 1;
 const OSD_MS: u32 = 600;
 const OSD_SIZE: (i32, i32) = (220, 110);
@@ -61,6 +73,8 @@ thread_local! {
     /// A modal loop (tray menu) is running: our frame loop can't step animations.
     static MODAL: Cell<bool> = const { Cell::new(false) };
     static APP: Cell<HWND> = Cell::new(HWND::default());
+    /// Tray icons by size, created once.
+    static ICONS: Cell<[Option<HICON>; 4]> = const { Cell::new([None; 4]) };
 }
 static TASKBAR_CREATED: AtomicU32 = AtomicU32::new(0);
 
@@ -97,6 +111,9 @@ fn main() {
         HOOKS.with(|h| *h.borrow_mut() = Some(hooks::start(app)));
         // Only now that nothing can fail: take back the saved layout.
         adopt_saved_layout();
+        // If Windows closes us to update the package, it may relaunch us afterwards. Never
+        // after a crash (a startup crash would loop) or a reboot (the startup task covers that).
+        let _ = RegisterApplicationRestart(None, RESTART_NO_CRASH | RESTART_NO_HANG | RESTART_NO_REBOOT);
         log!("running");
 
         message_loop();
@@ -174,6 +191,21 @@ unsafe fn register_hotkeys(app: HWND) -> Result<(), String> {
     Ok(())
 }
 
+/// Our icon at the tray's size for the primary monitor's scaling (created once per size).
+fn tray_icon() -> HICON {
+    let want = unsafe { GetSystemMetricsForDpi(SM_CXSMICON, win::primary_dpi()) };
+    let i = TRAY_ICONS.iter().position(|(s, _)| *s >= want).unwrap_or(TRAY_ICONS.len() - 1);
+    let mut icons = ICONS.get();
+    let icon = *icons[i].get_or_insert_with(|| {
+        let (size, png) = TRAY_ICONS[i];
+        unsafe { CreateIconFromResourceEx(png, true, 0x0003_0000, size, size, LR_DEFAULTCOLOR) }
+            .or_else(|_| unsafe { LoadIconW(None, IDI_APPLICATION) })
+            .unwrap_or_default()
+    });
+    ICONS.set(icons);
+    icon
+}
+
 unsafe fn tray(app: HWND, op: NOTIFY_ICON_MESSAGE) {
     let mut nid = NOTIFYICONDATAW {
         cbSize: size_of::<NOTIFYICONDATAW>() as u32,
@@ -181,7 +213,7 @@ unsafe fn tray(app: HWND, op: NOTIFY_ICON_MESSAGE) {
         uID: 1,
         uFlags: NIF_ICON | NIF_MESSAGE | NIF_TIP,
         uCallbackMessage: WM_TRAY,
-        hIcon: unsafe { LoadIconW(None, IDI_APPLICATION).unwrap_or_default() },
+        hIcon: tray_icon(),
         ..Default::default()
     };
     let tip: Vec<u16> = "screen-shifter (Ctrl+Alt+\u{2190}/\u{2192})".encode_utf16().collect();
@@ -513,6 +545,9 @@ fn show_osd(slot: usize, count: usize, monitor: RECT) {
 
 unsafe extern "system" fn osd_proc(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     unsafe {
+        if msg == WM_CLOSE {
+            return LRESULT(0); // only the app window decides when we close
+        }
         if msg == WM_TIMER && wp.0 == OSD_TIMER {
             let _ = KillTimer(Some(h), OSD_TIMER);
             let _ = ShowWindow(h, SW_HIDE);
@@ -580,11 +615,23 @@ unsafe extern "system" fn app_proc(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) ->
             hooks::WM_HOOK_LDOWN => on_ldown(hooks::unpack(lp.0 as u64)),
             hooks::WM_HOOK_LUP => on_lup(hooks::unpack(lp.0 as u64)),
             hooks::WM_HOOK_MOVE => on_move(),
+            // Logoff, shutdown, and Windows closing us to update or remove the package.
             WM_QUERYENDSESSION => {
-                show_all(); // so "save changes?" prompts are visible
+                show_all(); // "save changes?" prompts visible; layout kept for the next start
                 return LRESULT(1);
             }
+            WM_ENDSESSION => {
+                if wp.0 != 0 {
+                    shutdown(h);
+                }
+            }
+            WM_CLOSE => {
+                show_all();
+                shutdown(h);
+            }
+            WM_SETTINGCHANGE => tray(h, NIM_MODIFY), // scaling may have changed
             WM_DISPLAYCHANGE => {
+                tray(h, NIM_MODIFY);
                 anim::clear_all();
                 let reset = STATE.with(|s| s.borrow_mut().reset_if_monitors_changed(&win::monitor_names()));
                 if let Some(entries) = reset {
@@ -604,10 +651,66 @@ unsafe extern "system" fn app_proc(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) ->
     }
 }
 
+/// Exit without showing anything (callers show first): unhook, unregister, remove the tray
+/// icon, destroy the app window. Safe to call twice. At logoff the process may be killed
+/// as soon as this returns, so nothing may follow DestroyWindow.
+fn shutdown(app: HWND) {
+    unsafe {
+        let _ = EndMenu(); // a close request can arrive while the tray menu is open
+        cancel_drag();
+        panel::hide();
+        if let Some(h) = HOOKS.with(|h| h.borrow_mut().take()) {
+            hooks::stop(h);
+        }
+        let _ = UnregisterHotKey(Some(app), HK_PREV);
+        let _ = UnregisterHotKey(Some(app), HK_NEXT);
+        tray(app, NIM_DELETE);
+        let _ = DestroyWindow(app);
+    }
+}
+
+/// The package's startup task, or None in a dev build (no package identity).
+/// Blocking waits are fine here: desktop apps get no consent UI from these calls.
+fn startup_task() -> Option<StartupTask> {
+    StartupTask::GetAsync(&windows::core::HSTRING::from(STARTUP_TASK)).ok()?.join().ok()
+}
+
+/// Tray menu item for the startup task: label, flags.
+fn startup_item(state: Option<StartupTaskState>) -> (PCWSTR, MENU_ITEM_FLAGS) {
+    match state {
+        None => (w!("Start with Windows (installed app only)"), MF_GRAYED),
+        Some(StartupTaskState::Enabled) => (w!("Start with Windows"), MF_CHECKED),
+        Some(StartupTaskState::EnabledByPolicy) => (w!("Start with Windows"), MF_CHECKED | MF_GRAYED),
+        Some(StartupTaskState::DisabledByUser) => (w!("Start with Windows (turn on in Settings)"), MF_UNCHECKED),
+        Some(StartupTaskState::DisabledByPolicy) => (w!("Start with Windows"), MF_GRAYED),
+        Some(_) => (w!("Start with Windows"), MF_UNCHECKED),
+    }
+}
+
+fn toggle_startup(task: &StartupTask) {
+    match task.State() {
+        Ok(StartupTaskState::Enabled) => {
+            let _ = task.Disable();
+        }
+        Ok(StartupTaskState::Disabled) => {
+            let _ = task.RequestEnableAsync().and_then(|op| op.join());
+        }
+        // Windows won't let an app re-enable what the user turned off: send them there.
+        Ok(StartupTaskState::DisabledByUser) => unsafe {
+            ShellExecuteW(None, w!("open"), w!("ms-settings:startupapps"), None, None, SW_SHOWNORMAL);
+        },
+        _ => {}
+    }
+}
+
 unsafe fn tray_menu(app: HWND) {
     unsafe {
+        let task = startup_task();
+        let (label, flags) = startup_item(task.as_ref().and_then(|t| t.State().ok()));
         let menu = CreatePopupMenu().unwrap();
         let _ = AppendMenuW(menu, MF_STRING, CMD_RESTORE as usize, w!("Restore all windows"));
+        let _ = AppendMenuW(menu, MF_STRING | flags, CMD_STARTUP as usize, label);
+        let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
         let _ = AppendMenuW(menu, MF_STRING, CMD_EXIT as usize, w!("Exit"));
         let mut pt = Default::default();
         let _ = GetCursorPos(&mut pt);
@@ -620,17 +723,14 @@ unsafe fn tray_menu(app: HWND) {
         let _ = DestroyMenu(menu);
         match cmd.0 {
             CMD_RESTORE => restore_all(),
+            CMD_STARTUP => {
+                if let Some(t) = &task {
+                    toggle_startup(t);
+                }
+            }
             CMD_EXIT => {
                 show_all(); // the next start takes them back
-                cancel_drag();
-                panel::hide();
-                if let Some(h) = HOOKS.with(|h| h.borrow_mut().take()) {
-                    hooks::stop(h);
-                }
-                let _ = UnregisterHotKey(Some(app), HK_PREV);
-                let _ = UnregisterHotKey(Some(app), HK_NEXT);
-                tray(app, NIM_DELETE);
-                let _ = DestroyWindow(app);
+                shutdown(app);
             }
             _ => {}
         }

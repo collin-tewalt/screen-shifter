@@ -445,6 +445,9 @@ unsafe extern "system" fn panel_proc(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             paint(h);
             return LRESULT(0);
         }
+        if msg == WM_CLOSE {
+            return LRESULT(0); // only the app window decides when we close
+        }
         DefWindowProcW(h, msg, wp, lp)
     }
 }
@@ -452,6 +455,9 @@ unsafe extern "system" fn panel_proc(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
 // ---------- drag ghost ----------
 
 unsafe extern "system" fn ghost_proc(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    if msg == WM_CLOSE {
+        return LRESULT(0);
+    }
     unsafe { DefWindowProcW(h, msg, wp, lp) }
 }
 

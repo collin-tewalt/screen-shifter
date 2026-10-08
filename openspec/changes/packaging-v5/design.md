@@ -77,9 +77,9 @@ WM_ENDSESSION(FALSE)→ cancelled: keep running (state already reset to one slot
 
 `RegisterApplicationRestart(None, RESTART_NO_CRASH | RESTART_NO_HANG | RESTART_NO_REBOOT)` at startup: if the Restart Manager closed the app, it may relaunch it after the update (only after ≥ 60 s of running; whether deployment does this for packaged apps is unverified, the spike checks). Not restarted by registration after crashes (would loop on a startup crash) or reboots (the startup task covers sign-in). Nothing depends on the relaunch for safety: windows were shown before exit, and the next launch (manual or at sign-in) takes them back.
 
-`WM_CLOSE` (sent by `taskkill` without `/f`, some installers, and Restart Manager fallbacks to top-level windows, hidden ones included) is handled exactly like tray Exit: `show_all()` then `shutdown()`. Today it falls to `DefWindowProc` → `DestroyWindow` → quit with windows still hidden.
+`WM_CLOSE` (sent by some installers and tools to a process's top-level windows) is handled exactly like tray Exit. (Found in testing: `taskkill` without `/f` only targets *visible* windows, so for a tray app it reports success and does nothing; harmless.): `show_all()` then `shutdown()`. Today it falls to `DefWindowProc` → `DestroyWindow` → quit with windows still hidden.
 
-Exit is refactored into `shutdown()` used by tray Exit, `WM_CLOSE`, and `WM_ENDSESSION(TRUE)`. The other top-level windows (OSD, panels, sheets, ghost) also receive `WM_CLOSE` from `taskkill`/Restart Manager; their procs ignore it so they aren't destroyed piecemeal while the app window shuts down. It calls `EndMenu()` first (a `WM_CLOSE` can arrive while the tray menu's modal loop runs). Nothing important may follow `DestroyWindow` in it: at real logoff the process can be killed right after the handler returns.
+Exit is refactored into `shutdown()` used by tray Exit, `WM_CLOSE`, and `WM_ENDSESSION(TRUE)`. The other top-level windows (OSD, panels, sheets, ghost) can receive `WM_CLOSE` too; their procs ignore it so they aren't destroyed piecemeal while the app window shuts down. It calls `EndMenu()` first (a `WM_CLOSE` can arrive while the tray menu's modal loop runs). Nothing important may follow `DestroyWindow` in it: at real logoff the process can be killed right after the handler returns.
 
 If Windows kills without asking (the spike checks): windows stay hidden until the app next runs (it adopts them from the file); after an uninstall it never runs again. Code can't fix that case, so the spike result decides the README guidance ("Exit before uninstalling").
 
@@ -90,6 +90,17 @@ Before the rest: build the package with the manifest and `WM_CLOSE`/`WM_ENDSESSI
 (b) the same with `-ForceApplicationShutdown`;
 (c) uninstall while running (`Remove-AppxPackage`, and once from Settings → Apps).
 Log every message the app window receives with its lParam, and in any relaunched instance whether it has package identity (`GetCurrentPackageFullName`; a relaunch without identity would use the dev state folder) (to a file in the state folder, since a packaged release build has no console), whether windows reappear, and whether the app relaunches. Results go into this section.
+
+**Results (2026-10-08, Windows 11 26200, sideloaded 0.5.0.0 → 0.5.0.1, a game window hidden in slot 2):**
+
+| Case | What Windows did | Hidden windows |
+|---|---|---|
+| (a) `Add-AppxPackage`, defaults | Refused: `0x80073D02` "apps need to be closed"; nothing sent to the app | stayed in their slot, app kept running |
+| (b) `-ForceApplicationShutdown` | `WM_QUERYENDSESSION lp=ENDSESSION_CLOSEAPP` → `WM_ENDSESSION wp=1` → relaunched within the same second from the new version's folder, with package identity | shown, then taken back into slot 2 by the relaunch |
+| (c) `Remove-AppxPackage` | same two messages, no relaunch | shown |
+| (c) Settings → Apps → Uninstall | same two messages, no relaunch | shown |
+
+So the polite path holds for update and both uninstalls, and `RegisterApplicationRestart` does relaunch a packaged app after a forced update (with identity, so the packaged state folder is used). The only way left to strand windows is a hard kill (`taskkill /f`, Task Manager → End task); the next launch takes them back. No "Exit before uninstalling" guidance is needed. The spike log was removed afterwards.
 
 Sideloading needs one of: Developer Mode (Settings → System → For developers) with `Add-AppxPackage -Register` of the staged folder, or a self-signed certificate trusted in Local Machine → Trusted People with the signed `.msix`. The update test needs the real `.msix` path (a registered folder doesn't go through the same update). Both are one-time user actions (they change machine security settings).
 

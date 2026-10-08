@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Template: tools/package.py fills {{NAME}}, {{PUBLISHER}}, {{VERSION}}. -->
+<Package
+  xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10"
+  xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10"
+  xmlns:desktop="http://schemas.microsoft.com/appx/manifest/desktop/windows10"
+  xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities"
+  IgnorableNamespaces="uap desktop rescap">
+
+  <Identity Name="{{NAME}}" Publisher="{{PUBLISHER}}" Version="{{VERSION}}" ProcessorArchitecture="x64" />
+
+  <Properties>
+    <DisplayName>screen-shifter</DisplayName>
+    <PublisherDisplayName>{{PUBLISHER_DISPLAY}}</PublisherDisplayName>
+    <Logo>Assets\StoreLogo.png</Logo>
+    <Description>Per-monitor desktops: switch one monitor's windows while the other stays put.</Description>
+  </Properties>
+
+  <Dependencies>
+    <!-- 2004: WDA_EXCLUDEFROMCAPTURE keeps our overlays out of screenshots -->
+    <TargetDeviceFamily Name="Windows.Desktop" MinVersion="10.0.19041.0" MaxVersionTested="10.0.26100.0" />
+  </Dependencies>
+
+  <Resources>
+    <Resource Language="en-us" />
+  </Resources>
+
+  <Capabilities>
+    <rescap:Capability Name="runFullTrust" />
+  </Capabilities>
+
+  <Applications>
+    <Application Id="ScreenShifter" Executable="screen-shifter.exe" EntryPoint="Windows.FullTrustApplication">
+      <uap:VisualElements
+        DisplayName="screen-shifter"
+        Description="Per-monitor desktops"
+        BackgroundColor="transparent"
+        Square150x150Logo="Assets\Square150x150Logo.png"
+        Square44x44Logo="Assets\Square44x44Logo.png"
+        AppListEntry="default" />
+      <Extensions>
+        <!-- Enabled on first launch; the tray menu and Settings > Apps > Startup toggle it. -->
+        <desktop:Extension Category="windows.startupTask" Executable="screen-shifter.exe" EntryPoint="Windows.FullTrustApplication">
+          <desktop:StartupTask TaskId="ScreenShifter" Enabled="true" DisplayName="screen-shifter" />
+        </desktop:Extension>
+      </Extensions>
+    </Application>
+  </Applications>
+</Package>

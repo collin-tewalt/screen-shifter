@@ -5,6 +5,7 @@ use std::ffi::c_void;
 use std::path::PathBuf;
 use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
+use windows::Win32::Storage::Packaging::Appx::GetCurrentPackageFullName;
 use windows::Win32::System::SystemInformation::GetTickCount64;
 use windows::Win32::Foundation::{HWND, LPARAM, POINT, RECT, TRUE};
 use windows::core::BOOL;
@@ -95,6 +96,16 @@ pub fn monitor_at(pt: POINT) -> (String, RECT) {
         let m = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
         (monitor_name(m), monitor_info(m).monitorInfo.rcMonitor)
     }
+}
+
+/// Effective DPI of the primary monitor (where the tray is).
+pub fn primary_dpi() -> u32 {
+    let (mut x, mut y) = (96, 96);
+    unsafe {
+        let m = MonitorFromPoint(POINT::default(), MONITOR_DEFAULTTOPRIMARY);
+        let _ = GetDpiForMonitor(m, MDT_EFFECTIVE_DPI, &mut x, &mut y);
+    }
+    x
 }
 
 /// Name and full rect of the monitor under the mouse cursor.
@@ -410,10 +421,27 @@ pub fn has_focus(entries: &[Entry]) -> bool {
 
 // ---------- state file ----------
 
-fn state_path() -> PathBuf {
-    let base = std::env::var_os("LOCALAPPDATA").map_or_else(std::env::temp_dir, PathBuf::from);
-    base.join("screen-shifter").join("hidden.txt")
+/// Running as the installed MSIX package (has package identity), not a dev build.
+pub fn packaged() -> bool {
+    static PACKAGED: OnceLock<bool> = OnceLock::new();
+    *PACKAGED.get_or_init(|| {
+        let mut len = 0;
+        // fails with APPMODEL_ERROR_NO_PACKAGE without identity, else "buffer too small"
+        unsafe { GetCurrentPackageFullName(&mut len, None) }.0 != 15700
+    })
 }
+
+/// The package gets its own folder: Windows only redirects *new* AppData files into the
+/// package's private storage, so sharing a pre-existing dev folder would split the file.
+fn state_dir() -> PathBuf {
+    let base = std::env::var_os("LOCALAPPDATA").map_or_else(std::env::temp_dir, PathBuf::from);
+    base.join(if packaged() { "screen-shifter-pkg" } else { "screen-shifter" })
+}
+
+fn state_path() -> PathBuf {
+    state_dir().join("hidden.txt")
+}
+
 
 /// When Windows started, in ms since the Unix epoch (fixed for the life of the process).
 /// Saved window handles mean nothing after a restart.
