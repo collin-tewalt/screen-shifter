@@ -8,7 +8,7 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::w;
 
-pub const SHEET_MS: u64 = 220;
+pub const SHEET_MS: u64 = 300;
 pub const CHAIN_MS: u64 = 80;
 pub const HARD_LIMIT_MS: u64 = 1000;
 const SHADOW: i32 = 24;
@@ -90,6 +90,9 @@ struct Sheet {
     width: i32,
     motion: Motion,
     created: u64,
+    /// The motion's clock starts at the first animation frame, not at creation: the
+    /// capture and the switch work in between would otherwise eat most of the slide.
+    started: bool,
     /// Created since the last composed frame: its capture would be stale for another switch.
     fresh: bool,
 }
@@ -210,7 +213,7 @@ pub fn start_sheet(monitor: &str, rect: RECT, slide: Slide, scale: f32, now: u64
         .unwrap_or_default()
     };
     exclude_from_capture(hwnd);
-    let sheet = Sheet { monitor: monitor.to_string(), hwnd, dc, bmp, old, rect, width, motion, created: now, fresh: true };
+    let sheet = Sheet { monitor: monitor.to_string(), hwnd, dc, bmp, old, rect, width, motion, created: now, started: false, fresh: true };
     sheet.draw(now);
     // Below any sheets still moving on this monitor; they hurry off on top of it.
     let below = SHEETS.with(|s| {
@@ -232,7 +235,12 @@ pub fn start_sheet(monitor: &str, rect: RECT, slide: Slide, scale: f32, now: u64
 pub fn step(now: u64) {
     let sheets = SHEETS.with(|s| std::mem::take(&mut *s.borrow_mut()));
     let mut keep = Vec::new();
-    for sheet in sheets {
+    for mut sheet in sheets {
+        if !sheet.started {
+            crate::log!("sheet on {}: first frame {} ms after capture", sheet.monitor, now.saturating_sub(sheet.created));
+            sheet.motion.start = now;
+            sheet.started = true;
+        }
         let expired = now.saturating_sub(sheet.created) > HARD_LIMIT_MS;
         if !expired && sheet.draw(now) && !sheet.motion.done(now) {
             keep.push(sheet);
@@ -308,7 +316,7 @@ mod tests {
         let h = m.hurried(50);
         assert_eq!(h.from, m.at(50), "no jump");
         assert_eq!(h.dur, CHAIN_MS);
-        let late = m.hurried(200);
+        let late = m.hurried(SHEET_MS - 20);
         assert_eq!(late.dur, 20, "never slower than what was left");
     }
 

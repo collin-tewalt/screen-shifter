@@ -1,7 +1,7 @@
 ## ADDED Requirements
 
 ### Requirement: Switching slides the old slot off the screen
-On every successful switch (wheel, tilt, arrow hotkeys, or tile click), when Windows animation effects are enabled, the affected monitor SHALL show a still picture of its previous contents that slides off the monitor in about 220 ms with an ease-out motion and a soft shadow on its trailing edge, revealing the new slot. It SHALL slide left when moving to a higher-numbered slot and right when moving to a lower-numbered slot. The picture MUST stay within the affected monitor, MUST NOT take focus or intercept input, and MUST NOT affect the other monitor.
+On every successful switch (wheel, tilt, arrow hotkeys, or tile click), when Windows animation effects are enabled, the affected monitor SHALL show a still picture of its previous contents that slides off the monitor in about 300 ms, measured from when it first starts moving, with an ease-out motion and a soft shadow on its trailing edge, revealing the new slot. It SHALL slide left when moving to a higher-numbered slot and right when moving to a lower-numbered slot. The picture MUST stay within the affected monitor, MUST NOT take focus or intercept input, and MUST NOT affect the other monitor.
 
 #### Scenario: Next slides left
 - **WHEN** monitor A is on slot 1 and the user scrolls up with `Ctrl+Alt` held

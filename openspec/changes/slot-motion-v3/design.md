@@ -31,7 +31,7 @@ One overlay window per sheet: `WS_POPUP`, `WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX
 Our overlays are excluded by the window filter (own pid), so they never become slot contents.
 
 ### 3. Timeline and the frame loop
-Duration 220 ms, ease-out cubic (`1 - (1-t)^3`). Animations live in a main-thread list (`anim.rs`). The main loop becomes:
+Duration 300 ms (220 felt too quick in use), ease-out cubic (`1 - (1-t)^3`). **The clock starts at the sheet's first animation frame**, not when it is created: capture (~30 ms), the `DwmFlush`, the switch, and the panel refresh all happen in between, and with an ease-out curve starting the clock early meant most of the slide had already elapsed before it was ever drawn (found in use: the motion was nearly imperceptible). Animations live in a main-thread list (`anim.rs`). The main loop becomes:
 ```
 loop {
   if animations active: drain messages with PeekMessage/Dispatch, step every animation
