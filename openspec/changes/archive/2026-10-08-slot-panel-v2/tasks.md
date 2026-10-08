@@ -1,8 +1,8 @@
 ## 1. Spikes (throwaway; only touch windows whose process the spike launched, matched by PID)
 
 - [x] 1.1 Ghost: `DwmRegisterThumbnail` of a spawned window into a topmost tool popup sized to the thumbnail with opacity ~60%; confirm it looks translucent (no opaque background) and tracks the cursor smoothly. If not, try `DwmExtendFrameIntoClientArea`, else fall back to `PrintWindow` + `UpdateLayeredWindow`. Record in design §6 — resolved by design: built as a PrintWindow snapshot (design §6) instead of spiking DWM thumbnails
-- [ ] 1.2 Cross-monitor move: `SetWindowPlacement(WPF_ASYNCWINDOWPLACEMENT)` to the other monitor then `ShowWindowAsync(SW_HIDE)`, then `SW_SHOWNA` — confirm it hides and reappears on the new monitor, for normal and maximized windows. Record in design §7 — folded into manual verification 6.2 (needs the G502 and a real cross-monitor drag)
-- [ ] 1.3 Hooks: dedicated thread with `WH_KEYBOARD_LL` + `WH_MOUSE_LL`, logging Ctrl/Alt transitions, wheel, and G502 tilt messages; confirm tilt arrives as `WM_MOUSEHWHEEL` and swallowing works (browser doesn't zoom). Also: does `SetForegroundWindow` succeed when triggered from a hook-posted message? If not, verify the `SendInput(0xE8)` nudge (design §10) — folded into manual verification 6.2 (needs the G502 and a real cross-monitor drag)
+- [x] 1.2 Cross-monitor move: `SetWindowPlacement(WPF_ASYNCWINDOWPLACEMENT)` to the other monitor then `ShowWindowAsync(SW_HIDE)`, then `SW_SHOWNA` — confirm it hides and reappears on the new monitor, for normal and maximized windows. Record in design §7 — folded into manual verification 6.2 (needs the G502 and a real cross-monitor drag) — signed off by user on the v0.2 build (2026-10-07)
+- [x] 1.3 Hooks: dedicated thread with `WH_KEYBOARD_LL` + `WH_MOUSE_LL`, logging Ctrl/Alt transitions, wheel, and G502 tilt messages; confirm tilt arrives as `WM_MOUSEHWHEEL` and swallowing works (browser doesn't zoom). Also: does `SetForegroundWindow` succeed when triggered from a hook-posted message? If not, verify the `SendInput(0xE8)` nudge (design §10) — folded into manual verification 6.2 (needs the G502 and a real cross-monitor drag) — signed off by user on the v0.2 build (2026-10-07)
 
 ## 2. Core (`src/core.rs`)
 
@@ -38,6 +38,6 @@
 ## 6. Verify
 
 - [x] 6.1 `cargo test`, `cargo clippy --all-targets -- -D warnings` clean
-- [ ] 6.2 Manual run-through of every scenario in `specs/slot-panel` and the new/modified `specs/monitor-slots` scenarios, with the G502
-- [ ] 6.3 Stuck-input drills: Ctrl+Alt+Del and lock/unlock while holding the chord, then click normally; press a title bar then Ctrl+Alt then release; release Ctrl+Alt mid-drag. Mouse never lags: drag and scroll quickly while a switch is in progress; normal scrolling and `Ctrl+Alt+T`-style shortcuts unaffected
+- [x] 6.2 Manual run-through of every scenario in `specs/slot-panel` and the new/modified `specs/monitor-slots` scenarios, with the G502 — signed off by user on the v0.2 build (2026-10-07)
+- [x] 6.3 Stuck-input drills: Ctrl+Alt+Del and lock/unlock while holding the chord, then click normally; press a title bar then Ctrl+Alt then release; release Ctrl+Alt mid-drag. Mouse never lags: drag and scroll quickly while a switch is in progress; normal scrolling and `Ctrl+Alt+T`-style shortcuts unaffected — signed off by user on the v0.2 build (2026-10-07)
 - [x] 6.4 README: new gestures
