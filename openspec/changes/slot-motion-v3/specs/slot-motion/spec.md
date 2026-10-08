@@ -28,7 +28,11 @@ When a switch happens on a monitor while a sheet is still moving there, the new 
 
 #### Scenario: Flick through three slots
 - **WHEN** the user scrolls three notches quickly on a monitor at slot 1
-- **THEN** three sheets peel off one after another and the monitor ends on slot 4 showing its live windows
+- **THEN** sheets peel off one after another, each showing a slot that was actually on screen, and the monitor ends on slot 4 showing its live windows
+
+#### Scenario: The panel is not part of the picture
+- **WHEN** the user switches with the wheel while the panel is visible
+- **THEN** the sliding picture does not contain a copy of the panel; only the live panel is visible
 
 ### Requirement: Dropped windows fly to their destination
 When animation effects are enabled, after a drag ends the ghost SHALL continue for about 180 ms and fade out:
@@ -62,3 +66,7 @@ Every animation SHALL be removed no later than 1 second after it starts, and imm
 #### Scenario: Monitor change mid-motion
 - **WHEN** a monitor is disconnected while a sheet is moving
 - **THEN** all sheets disappear at once and the screen shows live windows
+
+#### Scenario: Tray menu open
+- **WHEN** the user switches with the arrow hotkeys while the tray menu is open
+- **THEN** the switch happens without motion and no still picture appears

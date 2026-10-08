@@ -39,20 +39,23 @@ loop {
   else:                 GetMessage / Dispatch (blocks as today)
 }
 ```
-Running at the top of the loop (never nested inside a wndproc) avoids re-entrancy. A switch arriving mid-animation is handled within one frame. `DwmFlush` paces frames to the display refresh without timers.
-**Hard limit:** every animation is destroyed 1 s after it starts, whatever its state. On `WM_DISPLAYCHANGE`, Exit, and Restore all, every animation is destroyed immediately.
+Running at the top of the loop (never nested inside a wndproc) avoids re-entrancy. A switch arriving mid-animation is handled within one frame. `DwmFlush` paces frames to the display refresh without timers; if it returns in under 1 ms (nothing to compose), the loop sleeps 1 ms so it can't spin a core. The `PeekMessage` path exits on `WM_QUIT` like `GetMessage`.
+**Modal loops and blocking calls:** frames only advance at the top of our loop, so anything that runs its own loop or blocks would freeze a sheet mid-screen. Therefore: `clear_all()` runs before `TrackPopupMenu` (tray menu) and a `MODAL` flag disables motion while it is open; `ghost_start` calls `PrintWindow`, which can take 50–200 ms on Chrome/Electron, so `clear_all()` runs before it (a drag started mid-slide ends the slide).
+**Hard limit:** every animation is destroyed 1 s after it starts, whatever its state. Enforced twice: in `step`, and by a backstop `SetTimer` on the app window (`WM_TIMER` is dispatched even inside modal loops) that calls `clear_all` once the oldest animation is over 1 s old. `restore_all()` calls `clear_all()` first, which covers Restore all, Exit, and `WM_QUERYENDSESSION`; `WM_DISPLAYCHANGE` calls it too.
 
 ### 4. Chaining
-When a switch happens on a monitor that still has a sheet moving:
+**One new sheet per monitor per frame.** GDI `BitBlt` from the screen reads the last *composited* frame. Several switches handled before the next composition (`on_wheel` with a 240+ delta, or several queued wheel messages drained in one frame) would all capture the same stale picture. So if a monitor's newest sheet was created since the last frame-loop `DwmFlush`, a further switch on that monitor in the same frame happens with no new sheet (the sheet above already hides it).
+When a switch happens on a monitor that still has a sheet moving (from an earlier frame):
 1. capture the monitor — the existing sheet has `WDA_EXCLUDEFROMCAPTURE`, so the capture sees the live slot underneath (spike 1.1 confirms this holds for GDI `BitBlt`);
 2. create the new sheet **directly below** the existing sheets in z-order (still above every app window);
 3. switch underneath;
 4. the existing sheets' remaining time shrinks to at most 80 ms; the new sheet starts its full slide immediately.
 Visually: sheets peel off back to back, the top one fastest.
-*Fallback if spike 1.1 fails:* finish existing sheets instantly (destroy) before capturing. Fast scrolling then shows small pops instead of a clean stack, but nothing is ever wrong on screen.
+*Fallback if spike 1.1 fails:* finish existing sheets instantly (destroy), `DwmFlush`, then capture (the flush is needed because `BitBlt` reads the last composited frame). Fast scrolling then shows small pops instead of a clean stack, but nothing is ever wrong on screen.
 
-### 5. Z-order with other overlays
-Sheets are created topmost after the panels/OSD/ghost, so after creating a sheet, re-assert `HWND_TOPMOST` on the visible panels, the OSD, and the ghost (`SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE`). The panel stays readable while the sheet slides under it.
+### 5. Z-order with other overlays, and keeping them out of captures
+All our overlays (panels, OSD, ghost, sheets) get `SetWindowDisplayAffinity(WDA_EXCLUDEFROMCAPTURE)`, so a captured frame never contains the panel or indicator (otherwise a stale copy of the panel would slide out from under the live one on nearly every wheel switch). *If spike 1.1 shows GDI capture ignores the affinity:* hide panels/OSD/ghost, `DwmFlush`, capture, re-show them (one extra frame; the panel blinks). Side effect of the affinity: our overlays don't appear in the user's own screenshots or screen shares (documented).
+Sheets are created topmost after the other overlays, so after creating a sheet, re-assert `HWND_TOPMOST` on the visible panels, the OSD, and the ghost (`SWP_NOACTIVATE | SWP_NOMOVE | SWP_NOSIZE`). The panel stays readable while the sheet slides under it.
 
 ### 6. Flying soul
 The ghost already holds a scaled snapshot. `panel.rs` keeps that bitmap after `ghost_start`, and a ghost animation re-scales it per frame (`StretchBlt` into a small DIB) with constant alpha, then `UpdateLayeredWindow`. ~180 ms, ease-out.
@@ -60,8 +63,8 @@ The ghost already holds a scaled snapshot. `panel.rs` keeps that bitmap after `g
 |---|---|---|
 | Drop on a hidden slot | ghost rect → target tile rect, inset (shrinks) | 150 → 0 |
 | Drop on the other monitor's current slot | ghost rect → the window's new screen rect (from `relocate`'s computed target; grows) | 150 → 0 |
-| Cancel (drop elsewhere / chord released) | ghost rect → the root window's current `GetWindowRect` | 150 → 0 |
-The real hide/relocate happens at drop time exactly as in v0.2; the soul only plays on top. Panels may hide (chord released) while a soul is still flying; it simply finishes.
+| Cancel (drop elsewhere / chord released), or drop on its own monitor's current tile (no-op move) | ghost rect → the root window's current `GetWindowRect` | 150 → 0 |
+The real hide/relocate happens at drop time exactly as in v0.2; the soul only plays on top. Panels may hide (chord released) while a soul is still flying; it simply finishes. A new drag starting while a soul is flying ends the soul first (one ghost window). The "other monitor" target rect comes from `relocate`: for normal windows, its new `rcNormalPosition` converted from workspace to screen coordinates (add the primary work area origin); for maximized windows, the target monitor's work area.
 
 ### 7. Tile pulse
 When a window lands in a tile, `panel.rs` records `(monitor, slot, start)`; the panel paints that tile's background blended toward the accent color, fading over 300 ms, and the frame loop invalidates panels while a pulse is active.
@@ -78,7 +81,9 @@ Per switch: one capture (~5–15 ms at 1440p–4K) + ≤ 1 frame wait (step 3) b
 - [HDR on] → the captured frame is tone-mapped and slightly dimmer than live; accepted (user has HDR off); documented.
 - [`UpdateLayeredWindow` of a full 4K sheet may miss frames on slow GPUs] → frames are paced by `DwmFlush`; a dropped frame only shortens the motion. DirectComposition is the upgrade path.
 - [Frame captured before the previous slot finished painting during chaining] → the sheet may show a partly drawn window for a few frames. Accepted.
-- [An animation never ends due to a bug] → 1 s hard limit destroys it.
+- [An animation never ends due to a bug] → 1 s hard limit destroys it (in `step` and via the backstop timer).
+- [Capture fails (secure desktop, UAC, lock screen)] → `BitBlt` failure skips the sheet; the switch happens without motion.
+- [Ctrl+Alt+click during a slide] → grabs the live window under the picture (clicks pass through sheets), not the one drawn on it. Accepted; documented.
 
 ## Open Questions
 
