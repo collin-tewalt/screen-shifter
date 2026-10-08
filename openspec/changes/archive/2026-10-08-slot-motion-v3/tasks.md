@@ -23,6 +23,6 @@
 ## 4. Verify
 
 - [x] 4.1 `cargo test`, `cargo clippy --all-targets -- -D warnings` clean
-- [ ] 4.2 Manual run-through of every `specs/slot-motion` scenario on both monitors, including fast flicks and the neighbor-monitor check
-- [ ] 4.3 Mouse never lags while sheets run; turning Animation effects off restores v0.2 behavior
+- [x] 4.2 Manual run-through of every `specs/slot-motion` scenario on both monitors, including fast flicks and the neighbor-monitor check — signed off by user on the v0.3 build (2026-10-08); GPU smoothness deferred to a future gpu-motion change
+- [x] 4.3 Mouse never lags while sheets run; turning Animation effects off restores v0.2 behavior — signed off by user on the v0.3 build (2026-10-08); GPU smoothness deferred to a future gpu-motion change
 - [x] 4.4 README: animations, the Animation-effects switch, and that overlays don't appear in screenshots/screen sharing
