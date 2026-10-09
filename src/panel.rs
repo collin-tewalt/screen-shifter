@@ -6,17 +6,18 @@ use crate::core::{MAX_SLOTS, Target};
 use crate::win::{self, MonitorInfo};
 use std::cell::{Cell, RefCell};
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM};
+use windows::Win32::Graphics::Dwm::{DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND, DwmSetWindowAttribute};
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::Storage::Xps::{PRINT_WINDOW_FLAGS, PrintWindow};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{PCWSTR, w};
 
-/// What a panel shows: per slot, the titles of its windows.
+/// What a panel shows: per slot, its windows' icons (invalid = none) and titles.
 pub struct PanelData {
     pub monitor: String,
     pub active: usize,
-    pub titles: Vec<Vec<String>>,
+    pub titles: Vec<Vec<(HICON, String)>>,
 }
 
 struct Panel {
@@ -141,6 +142,9 @@ pub fn show(monitors: &[MonitorInfo], mut data: Vec<PanelData>) {
         let (rect, s) = place(m, tiles(&d));
         let hwnd = overlay(cls, rect);
         anim::exclude_from_capture(hwnd);
+        // Windows 11 rounds the panel's corners; ignored elsewhere.
+        let round = DWMWCP_ROUND;
+        let _ = unsafe { DwmSetWindowAttribute(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, &round as *const _ as *const _, size_of_val(&round) as u32) };
         unsafe {
             let _ = SetLayeredWindowAttributes(hwnd, COLORREF(0), 235, LWA_ALPHA);
         }
@@ -421,12 +425,17 @@ unsafe fn paint(h: HWND) {
                     let mut lr = RECT { left: r.left + pad, top: y, right: r.right - pad, bottom: y + line };
                     text(dc, "\u{2014}", &mut lr, DIM, DT_LEFT);
                 }
-                for (n, t) in titles.iter().enumerate() {
+                let icon = px(16, s);
+                for (n, (ic, t)) in titles.iter().enumerate() {
                     let mut lr = RECT { left: r.left + pad, top: y, right: r.right - pad, bottom: y + line };
                     if n == MAX_TITLES - 1 && titles.len() > MAX_TITLES {
                         text(dc, &format!("+{} more", titles.len() - n), &mut lr, DIM, DT_LEFT);
                         break;
                     }
+                    if !ic.is_invalid() {
+                        let _ = DrawIconEx(dc, lr.left, y + (line - icon) / 2, *ic, icon, icon, 0, None, DI_NORMAL);
+                    }
+                    lr.left += icon + px(6, s);
                     text(dc, t, &mut lr, TEXT, DT_LEFT);
                     y += line;
                 }

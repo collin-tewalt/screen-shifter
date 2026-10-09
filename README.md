@@ -26,7 +26,7 @@ Each monitor starts with one slot; you get more with **+ New** (up to 8). A slot
 
 Without the panel up, a "2 / 3" indicator flashes on that monitor. Whatever is open on a monitor when you leave a slot belongs to that slot. Hidden windows disappear from the taskbar and Alt+Tab.
 
-Switches animate: the old slot slides off to the left when you move toward the end and to the right when you move toward the start, and quick scrolling peels sheets off back to back. A dropped window's ghost flies into its tile (which pulses), glides to its new spot on the other monitor, or springs back if you cancel. Turn animations off with Windows' own **Settings → Accessibility → Visual effects → Animation effects**.
+Switches animate: a picture of the old slot holds for a moment while the windows underneath settle, then slides off to the left when you move toward the end and to the right when you move toward the start, and quick scrolling peels sheets off back to back. The slide is captured and moved on the GPU by the Windows compositor (Desktop Duplication + DirectComposition), so it stays smooth; where that isn't available (Remote Desktop, a rotated monitor, an unusual display format) it falls back to drawing frames itself. Set `SCREEN_SHIFTER_GDI=1` to force the fallback. A dropped window's ghost flies into its tile (which pulses), glides to its new spot on the other monitor, or springs back if you cancel. Turn animations off with Windows' own **Settings → Accessibility → Visual effects → Animation effects**.
 
 Tray icon (right-click): **Restore all windows**, **Start with Windows** (installed app only; on by default after the first launch, also in Settings → Apps → Startup), **Exit**.
 

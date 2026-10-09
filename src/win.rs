@@ -7,9 +7,11 @@ use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 use windows::Win32::Storage::Packaging::Appx::GetCurrentPackageFullName;
 use windows::Win32::System::SystemInformation::GetTickCount64;
-use windows::Win32::Foundation::{HWND, LPARAM, POINT, RECT, TRUE};
+use windows::Win32::Foundation::{HWND, LPARAM, POINT, RECT, TRUE, WPARAM};
 use windows::core::BOOL;
 use windows::Win32::Graphics::Dwm::{DWMWA_CLOAKED, DwmGetWindowAttribute};
+use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use windows::Win32::Graphics::Gdi::{
     EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITOR_DEFAULTTONEAREST,
     MONITOR_DEFAULTTONULL, MONITOR_DEFAULTTOPRIMARY, MONITOR_FROM_FLAGS, MONITORINFO,
@@ -153,6 +155,54 @@ fn class_of(h: HWND) -> String {
     let mut buf = [0u16; 256];
     let n = unsafe { GetClassNameW(h, &mut buf) };
     String::from_utf16_lossy(&buf[..n.max(0) as usize])
+}
+
+thread_local! {
+    /// Icons looked up while the panel is open (misses too), by HWND.
+    static ICONS: RefCell<HashMap<u64, HICON>> = RefCell::new(HashMap::new());
+    /// When the current panel build started: asking apps for icons stops after the budget.
+    static ICON_BUDGET: Cell<Option<std::time::Instant>> = const { Cell::new(None) };
+}
+
+/// Total time one panel build may spend asking apps for icons (`WM_GETICON`).
+const ICON_BUDGET_MS: u128 = 100;
+
+/// Starts a panel build's icon budget; `forget` drops cached icons (a new panel opening).
+pub fn icon_budget(forget: bool) {
+    if forget {
+        ICONS.with(|i| i.borrow_mut().clear());
+    }
+    ICON_BUDGET.set(Some(std::time::Instant::now()));
+}
+
+/// A window's small icon (invalid if none). Asks the app only within the build's budget and
+/// never waits on a hung one; otherwise uses the window class's icon. Handles are shared:
+/// never destroyed.
+pub fn icon_of(id: u64) -> HICON {
+    if let Some(i) = ICONS.with(|i| i.borrow().get(&id).copied()) {
+        return i;
+    }
+    let h = hwnd(id);
+    let in_budget = ICON_BUDGET.get().is_some_and(|t| t.elapsed().as_millis() < ICON_BUDGET_MS);
+    let asked = |kind: u32| {
+        let mut r = 0usize;
+        let ok = unsafe {
+            SendMessageTimeoutW(h, WM_GETICON, WPARAM(kind as usize), LPARAM(0), SMTO_ABORTIFHUNG | SMTO_BLOCK, 50, Some(&mut r))
+        };
+        (ok.0 != 0 && r != 0).then_some(HICON(r as *mut c_void))
+    };
+    let class = |index| {
+        let v = unsafe { GetClassLongPtrW(h, index) };
+        (v != 0).then_some(HICON(v as *mut c_void))
+    };
+    let icon = in_budget
+        .then(|| asked(ICON_SMALL2).or_else(|| asked(ICON_SMALL)).or_else(|| asked(ICON_BIG)))
+        .flatten()
+        .or_else(|| class(GCLP_HICONSM))
+        .or_else(|| class(GCLP_HICON))
+        .unwrap_or_default();
+    ICONS.with(|i| i.borrow_mut().insert(id, icon));
+    icon
 }
 
 pub fn title_of(h: HWND) -> String {

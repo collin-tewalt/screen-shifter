@@ -1,5 +1,6 @@
 //! Illusory switch motion: a still picture of the monitor ("sheet") covers it while the
-//! real switch happens underneath, then slides off. Frames are stepped from the main loop.
+//! real switch happens underneath, then slides off. GPU sheets (`gpu.rs`) are moved by the
+//! compositor; this file's GDI sheets are the fallback, stepped from the main loop.
 
 use std::cell::RefCell;
 use windows::Win32::Foundation::{COLORREF, HWND, LPARAM, LRESULT, POINT, RECT, SIZE, WPARAM};
@@ -8,16 +9,26 @@ use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::w;
 
-pub const SHEET_MS: u64 = 300;
-pub const CHAIN_MS: u64 = 80;
+pub const SHEET_MS: u64 = 400;
+pub const CHAIN_MS: u64 = 120;
+/// The sheet holds still this long after the switch before sliding: hides and shows are
+/// asynchronous, and sliding while they land shows windows popping in and out.
+pub const SETTLE_MS: u64 = 100;
 pub const HARD_LIMIT_MS: u64 = 1000;
-const SHADOW: i32 = 24;
-const SHADOW_ALPHA: f32 = 0.35;
+pub const SHADOW: i32 = 24;
+pub const SHADOW_ALPHA: f32 = 0.35;
 
 // ---------- pure helpers ----------
 
 pub fn ease_out(t: f32) -> f32 {
     1.0 - (1.0 - t.clamp(0.0, 1.0)).powi(3)
+}
+
+/// `ease_out` from `from` to `to` over `secs` as polynomial coefficients
+/// (constant, linear, quadratic, cubic) in seconds: 1-(1-u)^3 = 3u - 3u^2 + u^3.
+pub fn cubic_coeffs(from: f32, to: f32, secs: f32) -> (f32, f32, f32, f32) {
+    let d = to - from;
+    (from, 3.0 * d / secs, -3.0 * d / (secs * secs), d / (secs * secs * secs))
 }
 
 /// A value moving from `from` to `to` over `dur` ms starting at `start`, eased.
@@ -203,6 +214,15 @@ fn capture(rect: RECT, slide: Slide, shadow: i32) -> Option<(HDC, HBITMAP, HGDIO
 /// switch just happens without motion) if capture fails or this monitor already got a
 /// sheet this frame. Caller must `DwmFlush` before changing what's on screen.
 pub fn start_sheet(monitor: &str, rect: RECT, slide: Slide, scale: f32, now: u64) -> bool {
+    // One path per monitor while sheets run: a newer overlay would cover a GDI sheet and
+    // vice versa. GPU first; if it fails while GPU sheets run here, this switch gets none.
+    let gdi_running = SHEETS.with(|s| s.borrow().iter().any(|s| s.monitor == monitor));
+    if !gdi_running && crate::gpu::start_sheet(monitor, rect, slide, scale, now) {
+        return true;
+    }
+    if crate::gpu::busy(monitor) {
+        return false;
+    }
     let busy = SHEETS.with(|s| s.borrow().iter().any(|s| s.monitor == monitor && s.fresh));
     if busy {
         return false;
@@ -248,7 +268,7 @@ pub fn step(now: u64) {
     for mut sheet in sheets {
         if !sheet.started {
             crate::log!("sheet on {}: first frame {} ms after capture", sheet.monitor, now.saturating_sub(sheet.created));
-            sheet.motion.start = now;
+            sheet.motion.start = now + SETTLE_MS;
             sheet.started = true;
             sheet.last = now;
         }
@@ -271,8 +291,10 @@ pub fn step(now: u64) {
     SHEETS.with(|s| s.borrow_mut().extend(keep));
 }
 
-/// Backstop for modal loops (where `step` doesn't run): enforce only the hard limit.
+/// Timer tick: removes finished GPU sheets, and enforces the hard limit on GDI sheets
+/// (whose frames don't step inside modal loops).
 pub fn enforce_limit(now: u64) {
+    crate::gpu::reap(now);
     let sheets = SHEETS.with(|s| std::mem::take(&mut *s.borrow_mut()));
     let (expired, keep): (Vec<_>, Vec<_>) =
         sheets.into_iter().partition(|s| now.saturating_sub(s.created) > HARD_LIMIT_MS);
@@ -285,11 +307,18 @@ pub fn frame_composed() {
     SHEETS.with(|s| s.borrow_mut().iter_mut().for_each(|s| s.fresh = false));
 }
 
+/// GDI sheets need the main loop's frame mode; GPU sheets don't.
 pub fn active() -> bool {
     SHEETS.with(|s| !s.borrow().is_empty())
 }
 
+/// Any sheet of either kind (keeps the backstop timer alive).
+pub fn any() -> bool {
+    active() || crate::gpu::any()
+}
+
 pub fn clear_all() {
+    crate::gpu::clear_all();
     let sheets = SHEETS.with(|s| std::mem::take(&mut *s.borrow_mut()));
     sheets.into_iter().for_each(Sheet::destroy);
 }
@@ -328,6 +357,31 @@ mod tests {
         assert_eq!(m.at(500), 0.0, "before start");
         assert_eq!(m.at(1200), -100.0);
         assert!(m.done(1200) && !m.done(1199));
+    }
+
+    #[test]
+    fn cubic_matches_ease_out() {
+        let (from, to, secs) = (0.0f32, -2584.0f32, 0.4f32);
+        let (c, l, q, k) = cubic_coeffs(from, to, secs);
+        for i in 0..=10 {
+            let t = secs * i as f32 / 10.0;
+            let poly = c + l * t + q * t * t + k * t * t * t;
+            let eased = from + (to - from) * ease_out(t / secs);
+            assert!((poly - eased).abs() < 0.5, "t={t}: {poly} vs {eased}");
+        }
+    }
+
+    #[test]
+    fn gpu_frame_motion_matches_gdi_layout() {
+        // The GDI bitmap's left edge includes the shadow for Right; the GPU visual is the frame.
+        for slide in [Slide::Left, Slide::Right] {
+            let (off, m) = sheet_layout(slide, 2560, 2560, 24, 0);
+            let (g, shadow_x, at_left) = crate::gpu::frame_motion(slide, 2560, 24, 0);
+            assert_eq!(g.from, m.from + off as f32 - 2560.0, "{slide:?} from");
+            assert_eq!(g.to, m.to + off as f32 - 2560.0, "{slide:?} to");
+            assert_eq!(at_left, slide == Slide::Left);
+            assert_eq!(shadow_x, if slide == Slide::Left { 2560 } else { -24 });
+        }
     }
 
     #[test]

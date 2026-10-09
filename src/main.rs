@@ -5,6 +5,7 @@ mod core;
 #[macro_use]
 mod win;
 mod anim;
+mod gpu;
 mod hooks;
 mod panel;
 
@@ -313,6 +314,7 @@ fn run_switch(monitor: String, dir: Dir, pick: impl FnOnce(&mut core::State, &st
         let slide = if dir == Dir::Next { anim::Slide::Left } else { anim::Slide::Right };
         if anim::start_sheet(&monitor, m.rect, slide, m.scale, win::now_ms()) {
             raise_overlays();
+            gpu::wait_committed(); // a GPU sheet's commit is asynchronous
             unsafe {
                 // the sheet must be on screen before anything underneath changes
                 let _ = DwmFlush();
@@ -328,6 +330,8 @@ fn run_switch(monitor: String, dir: Dir, pick: impl FnOnce(&mut core::State, &st
     win::hide(&plan.hide);
     let shown = win::show(&plan.show);
     let t_hideshow = ms(t);
+    gpu::switched(&monitor);
+    gpu::go(); // the compositor slides the sheet from here; nothing below can stall it
     persist(&[]);
     win::focus_after_switch(&shown, &plan.hide);
     let t_focus = ms(t);
@@ -393,18 +397,20 @@ fn soul_home(entries: &[Entry]) {
     }
 }
 
-/// Titles of root windows (owned dialogs are left out of the lists).
-fn titles(entries: &[Entry]) -> Vec<String> {
+/// Icons and titles of root windows (owned dialogs are left out of the lists).
+fn titles(entries: &[Entry]) -> Vec<(HICON, String)> {
     entries
         .iter()
         .filter(|e| win::is_root(e.id))
-        .map(|e| win::title_of(win::hwnd(e.id)))
-        .filter(|t| !t.is_empty())
+        .map(|e| (e.id, win::title_of(win::hwnd(e.id))))
+        .filter(|(_, t)| !t.is_empty())
+        .map(|(id, t)| (win::icon_of(id), t))
         .collect()
 }
 
 /// One monitor's panel contents; `visible` = what's on screen in its current slot.
 fn panel_data_for(monitor: String, visible: &[Entry]) -> panel::PanelData {
+    win::icon_budget(false);
     let (active, slots) = STATE.with(|s| s.borrow().slots(&monitor));
     let titles = slots.iter().enumerate().map(|(i, s)| if i == active { titles(visible) } else { titles(s) }).collect();
     panel::PanelData { monitor, active, titles }
@@ -422,6 +428,7 @@ fn panel_data() -> Vec<panel::PanelData> {
 }
 
 fn show_panels() {
+    win::icon_budget(true); // icons are looked up afresh each time the panel opens
     panel::show(&win::monitors(), panel_data());
 }
 
@@ -593,7 +600,7 @@ unsafe extern "system" fn app_proc(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) ->
             }
             WM_TIMER if wp.0 == ANIM_TIMER => {
                 anim::enforce_limit(win::now_ms());
-                if !anim::active() {
+                if !anim::any() {
                     let _ = KillTimer(Some(h), ANIM_TIMER);
                 }
             }
@@ -633,6 +640,7 @@ unsafe extern "system" fn app_proc(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) ->
             WM_DISPLAYCHANGE => {
                 tray(h, NIM_MODIFY);
                 anim::clear_all();
+                gpu::reset(); // overlays are sized to the old monitors
                 let reset = STATE.with(|s| s.borrow_mut().reset_if_monitors_changed(&win::monitor_names()));
                 if let Some(entries) = reset {
                     log!("monitor set changed: restoring {}", entries.len());

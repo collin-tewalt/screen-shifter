@@ -78,7 +78,7 @@ GPU sheets need no frame stepping: `anim::active()` (which drives the main loop'
 
 ### 6. Timing constants
 
-`SHEET_MS = 400`, `CHAIN_MS = 120`, `HARD_LIMIT_MS = 1000` unchanged (400 + chain still well within).
+`SHEET_MS = 400`, `CHAIN_MS = 120`, `HARD_LIMIT_MS = 1000` unchanged. **`SETTLE_MS = 100`** (found in testing): hides/shows are asynchronous (`ShowWindowAsync`) and land over the next frames; sliding immediately revealed windows popping in and out (worst with overlapping windows and a maximized one). The sheet now holds still 100 ms before sliding. GPU: folded into the animation's absolute begin time (no waiting on our thread). GDI: the motion starts at first frame + 100 ms. Total ~500 ms, within the 1 s limit; chained sheets hurry from their current position as before (still static while settling).
 
 ### 7. Icons in tiles
 
@@ -100,6 +100,12 @@ Per window: class icon first (`GetClassLongPtrW(GCLP_HICONSM)`, `GCLP_HICON`: fr
 5. Rounded corners on the layered panel popup.
 
 Results recorded here; failures change §3/§4/§8, not the requirements.
+
+**Results (2026-10-09, 2× 2560×1440, same GPU):**
+- §9.2: `DuplicateOutput` + first usable `AcquireNextFrame` + copy: 5–10 ms per switch (20 ms the very first time) vs. 30–43 ms for BitBlt. Per-switch duplication confirmed (§3).
+- §9.0, §9.1, §9.3, §9.5: checked by the user in normal use: smooth slides, no flash before the sheet, panel not baked into the picture, click-through, rounded panel corners, icons in tiles.
+- Found: windows popping in and out under the moving sheet (async hides/shows still landing) → `SETTLE_MS` (§6).
+- Not separately exercised: the 100 ms stall test (§9.4) and the forced GDI fallback; the user judged the result good without them. The spike code was removed.
 
 ## Risks / Trade-offs
 
