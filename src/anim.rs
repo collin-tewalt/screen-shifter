@@ -295,6 +295,7 @@ pub fn step(now: u64) {
 /// (whose frames don't step inside modal loops).
 pub fn enforce_limit(now: u64) {
     crate::gpu::reap(now);
+    crate::expose::reap(now);
     let sheets = SHEETS.with(|s| std::mem::take(&mut *s.borrow_mut()));
     let (expired, keep): (Vec<_>, Vec<_>) =
         sheets.into_iter().partition(|s| now.saturating_sub(s.created) > HARD_LIMIT_MS);
@@ -314,11 +315,12 @@ pub fn active() -> bool {
 
 /// Any sheet of either kind (keeps the backstop timer alive).
 pub fn any() -> bool {
-    active() || crate::gpu::any()
+    active() || crate::gpu::any() || crate::expose::any()
 }
 
 pub fn clear_all() {
     crate::gpu::clear_all();
+    crate::expose::clear_all();
     let sheets = SHEETS.with(|s| std::mem::take(&mut *s.borrow_mut()));
     sheets.into_iter().for_each(Sheet::destroy);
 }

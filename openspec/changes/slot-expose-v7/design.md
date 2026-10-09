@@ -90,6 +90,11 @@ Removal after a transition rides the existing `ANIM_TIMER` (as v6 sheets): the t
 - Monitor change / Restore all / Exit: exposé removed immediately (`expose::clear_all`, alongside `anim::clear_all`). Panel hide: not removed (it finishes its own transition, §7).
 - Uploads happen when snapshots arrive (spread over the batch), so opening only builds visuals.
 
+### 10. Polish after first use (2026-10-09)
+
+- **Frosted backdrop:** a plain dim didn't make the previews stand out. DirectComposition can't blur what's behind a window, but we can capture the monitor (the v6 Desktop Duplication path, 5–10 ms) and show that picture under the previews with a Gaussian blur whose standard deviation animates 0 → 28 px while a tint fades to 0.3 (0.45 without a backdrop). Collapse animates the blur back to 0 (the picture becomes the live screen again); choose fades the backdrop out instead (the slot underneath changes). Filter effects need the newer composition device, so `gpu.rs` now creates it with `DCompositionCreateDevice3` (`IDCompositionDesktopDevice`, visuals are `IDCompositionVisual2`); sheets are unaffected. Capture failure → plain dim.
+- **Sharp landing on choose:** grid previews use a ≤ 800 px picture (crisp when small); flying that up to full size showed a blurry moment before the real window took over. The worker now also keeps the full-resolution frame (≤ 4096 px), both are uploaded to the GPU as they arrive (CPU copies dropped; nothing stored on the CPU any more), and the chosen preview switches to the full-resolution surface as it starts flying. Cost: GPU memory, ~15 MB per captured 2560×1440 window, dropped when the window closes or the device is lost (then cards until the next capture).
+
 ## Risks / Trade-offs
 
 - **Stale snapshots** of hidden windows (taken the last time they were visible with `Ctrl+Alt` pressed): accepted; it's what Mission Control does for minimized windows too.

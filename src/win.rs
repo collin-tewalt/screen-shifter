@@ -9,7 +9,7 @@ use windows::Win32::Storage::Packaging::Appx::GetCurrentPackageFullName;
 use windows::Win32::System::SystemInformation::GetTickCount64;
 use windows::Win32::Foundation::{HWND, LPARAM, POINT, RECT, TRUE, WPARAM};
 use windows::core::BOOL;
-use windows::Win32::Graphics::Dwm::{DWMWA_CLOAKED, DwmGetWindowAttribute};
+use windows::Win32::Graphics::Dwm::{DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS, DwmGetWindowAttribute};
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use windows::Win32::Graphics::Gdi::{
@@ -217,7 +217,7 @@ fn pid_of(h: HWND) -> u32 {
     pid
 }
 
-fn is_cloaked(h: HWND) -> bool {
+pub fn is_cloaked(h: HWND) -> bool {
     let mut cloaked = 0u32;
     unsafe {
         DwmGetWindowAttribute(h, DWMWA_CLOAKED, &mut cloaked as *mut _ as *mut c_void, 4).is_ok()
@@ -436,6 +436,45 @@ pub fn window_rect(id: u64) -> Option<RECT> {
     unsafe { GetWindowRect(hwnd(id), &mut r) }.ok().map(|_| r)
 }
 
+/// Where a window is on screen (visible frame, without the invisible resize borders);
+/// for a minimized window, where it would be restored. None if it's gone.
+pub fn frame_rect(id: u64) -> Option<RECT> {
+    let h = hwnd(id);
+    unsafe {
+        if !IsWindow(Some(h)).as_bool() {
+            return None;
+        }
+        if IsIconic(h).as_bool() {
+            let r = placement(h)?.rcNormalPosition; // workspace coordinates
+            let wa = primary_work_area();
+            return Some(RECT { left: r.left + wa.left, top: r.top + wa.top, right: r.right + wa.left, bottom: r.bottom + wa.top });
+        }
+        let mut r = RECT::default();
+        // Meaningless for a hidden window: fall back to its window rect.
+        if !IsWindowVisible(h).as_bool()
+            || DwmGetWindowAttribute(h, DWMWA_EXTENDED_FRAME_BOUNDS, &mut r as *mut _ as *mut c_void, size_of::<RECT>() as u32).is_err()
+        {
+            GetWindowRect(h, &mut r).ok()?;
+        }
+        Some(r)
+    }
+}
+
+pub fn is_visible(id: u64) -> bool {
+    unsafe { IsWindowVisible(hwnd(id)).as_bool() }
+}
+
+/// Gives a specific window keyboard focus, restoring it first if it's minimized.
+pub fn focus(id: u64) {
+    let h = hwnd(id);
+    unsafe {
+        if IsIconic(h).as_bool() {
+            let _ = ShowWindowAsync(h, SW_RESTORE);
+        }
+    }
+    set_foreground(h);
+}
+
 /// Keystrokes must never go to a hidden window.
 pub fn focus_after_switch(shown: &[Entry], just_hidden: &[Entry]) {
     let usable = |h: HWND| unsafe { !is_cloaked(h) && !IsIconic(h).as_bool() };
@@ -449,6 +488,10 @@ pub fn focus_after_switch(shown: &[Entry], just_hidden: &[Entry]) {
             })
         })
         .unwrap_or_else(|| unsafe { GetShellWindow() });
+    set_foreground(target);
+}
+
+fn set_foreground(target: HWND) {
     unsafe {
         if !SetForegroundWindow(target).as_bool() {
             // Hook-driven switches may lack the foreground right; any input event from our

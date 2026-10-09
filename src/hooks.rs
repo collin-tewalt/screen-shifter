@@ -14,7 +14,7 @@ use windows::Win32::UI::Input::KeyboardAndMouse::*;
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 pub const WM_CHORD_DOWN: u32 = WM_APP + 10;
-pub const WM_CHORD_UP: u32 = WM_APP + 11;
+pub const WM_CHORD_UP: u32 = WM_APP + 11; // wparam = why (RELEASED / TAINTED / RESET)
 pub const WM_HOOK_WHEEL: u32 = WM_APP + 12; // wparam = delta (i16), lparam = point
 pub const WM_HOOK_HWHEEL: u32 = WM_APP + 13;
 pub const WM_HOOK_LDOWN: u32 = WM_APP + 14;
@@ -25,6 +25,15 @@ pub const WM_HOOK_MOVE: u32 = WM_APP + 16; // point in MOVE_PT; clear MOVE_PENDI
 pub static CHORD: AtomicBool = AtomicBool::new(false);
 /// A window drag is in progress (moves are posted).
 pub static DRAG: AtomicBool = AtomicBool::new(false);
+/// The panel is up: moves are posted while the chord is held (for the exposé).
+pub static HOVER: AtomicBool = AtomicBool::new(false);
+
+/// Why the chord ended. Only a real release may act (choose a preview).
+pub const RELEASED: usize = 0;
+/// Another key was pressed (Ctrl+Alt+Del, an AltGr character).
+pub const TAINTED: usize = 1;
+/// Keys found up without us seeing it (secure desktop).
+pub const RESET: usize = 2;
 pub static MOVE_PENDING: AtomicBool = AtomicBool::new(false);
 pub static MOVE_PT: AtomicU64 = AtomicU64::new(0);
 
@@ -51,10 +60,10 @@ fn post(msg: u32, wp: usize, pt: POINT) {
     }
 }
 
-fn update_chord() {
+fn update_chord(why: usize) {
     let now = CTRL.load(SeqCst) && ALT.load(SeqCst) && !TAINT.load(SeqCst);
     if CHORD.swap(now, SeqCst) != now {
-        post(if now { WM_CHORD_DOWN } else { WM_CHORD_UP }, 0, POINT::default());
+        post(if now { WM_CHORD_DOWN } else { WM_CHORD_UP }, if now { 0 } else { why }, POINT::default());
     }
 }
 
@@ -70,10 +79,11 @@ unsafe extern "system" fn keyboard(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT
                 _ if down && (CTRL.load(SeqCst) || ALT.load(SeqCst)) => TAINT.store(true, SeqCst),
                 _ => {}
             }
+            let why = if TAINT.load(SeqCst) { TAINTED } else { RELEASED };
             if !CTRL.load(SeqCst) && !ALT.load(SeqCst) {
                 TAINT.store(false, SeqCst);
             }
-            update_chord();
+            update_chord(why);
         }
     }
     unsafe { CallNextHookEx(None, code, wp, lp) }
@@ -92,7 +102,7 @@ unsafe extern "system" fn mouse(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT {
             CTRL.store(false, SeqCst);
             ALT.store(false, SeqCst);
             TAINT.store(false, SeqCst);
-            update_chord();
+            update_chord(RESET);
         }
         let chord = CHORD.load(SeqCst);
         let delta = (m.mouseData >> 16) as u16 as i16 as isize as usize;
@@ -114,7 +124,7 @@ unsafe extern "system" fn mouse(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT {
                 post(WM_HOOK_HWHEEL, delta, pt);
                 true
             }
-            WM_MOUSEMOVE if DRAG.load(SeqCst) => {
+            WM_MOUSEMOVE if DRAG.load(SeqCst) || (chord && HOVER.load(SeqCst)) => {
                 MOVE_PT.store(pack(pt), SeqCst);
                 if !MOVE_PENDING.swap(true, SeqCst) {
                     post(WM_HOOK_MOVE, 0, pt);

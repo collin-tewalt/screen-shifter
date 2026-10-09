@@ -5,7 +5,9 @@ mod core;
 #[macro_use]
 mod win;
 mod anim;
+mod expose;
 mod gpu;
+mod snap;
 mod hooks;
 mod panel;
 
@@ -57,6 +59,9 @@ const WHEEL_NOTCH: i32 = 120;
 /// Backstop for the animation hard limit; WM_TIMER still arrives inside modal loops.
 const ANIM_TIMER: usize = 3;
 const ANIM_TIMER_MS: u32 = 250;
+/// Resting on a tile this long opens its exposé.
+const HOVER_TIMER: usize = 4;
+const HOVER_MS: u32 = 300;
 
 thread_local! {
     static STATE: RefCell<core::State> = RefCell::default();
@@ -74,6 +79,13 @@ thread_local! {
     /// A modal loop (tray menu) is running: our frame loop can't step animations.
     static MODAL: Cell<bool> = const { Cell::new(false) };
     static APP: Cell<HWND> = Cell::new(HWND::default());
+    /// The tile the mouse is resting on, waiting for HOVER_TIMER.
+    static HOVER_TILE: RefCell<Option<(String, usize)>> = const { RefCell::new(None) };
+    /// Exposé preview under a left-down (chosen if the up lands on it too).
+    static PRESSED_PREVIEW: Cell<Option<usize>> = const { Cell::new(None) };
+    /// Each monitor's visible windows as of the panel opening (updated by switches and drops):
+    /// the exposé of a current slot, without re-enumerating on every hover.
+    static VISIBLE: RefCell<std::collections::HashMap<String, Vec<Entry>>> = RefCell::new(Default::default());
     /// Tray icons by size, created once.
     static ICONS: Cell<[Option<HICON>; 4]> = const { Cell::new([None; 4]) };
 }
@@ -250,6 +262,85 @@ fn on_switch(monitor: String, dir: Dir) {
     run_switch(monitor, dir, |s, m, visible, now| s.switch(m, dir, visible, now));
 }
 
+fn arm_anim_timer() {
+    unsafe {
+        SetTimer(Some(APP.get()), ANIM_TIMER, ANIM_TIMER_MS, None);
+    }
+}
+
+fn stop_hover() {
+    HOVER_TILE.with(|t| t.borrow_mut().take());
+    unsafe {
+        let _ = KillTimer(Some(APP.get()), HOVER_TIMER);
+    }
+}
+
+/// Spreads slot `i` of `monitor` (its current slot: the windows on screen).
+fn open_expose(monitor: String, i: usize) {
+    let (active, slots) = STATE.with(|s| s.borrow().slots(&monitor));
+    let current = i == active;
+    let entries: Vec<Entry> = if current {
+        VISIBLE.with(|v| v.borrow().get(&monitor).cloned().unwrap_or_default())
+    } else {
+        slots.get(i).cloned().unwrap_or_default()
+    };
+    let roots: Vec<Entry> = entries.into_iter().filter(|e| win::is_root(e.id)).collect();
+    let tile = panel::tile_screen_rect(&monitor, i);
+    if expose::open(&monitor, i, current, &roots, tile, motion_on()) {
+        arm_anim_timer();
+    }
+}
+
+/// Mouse moved with the panel up (not dragging): open, swap, highlight, or collapse.
+fn on_hover(pt: POINT) {
+    let open = expose::open_slot();
+    match panel::hit(pt) {
+        Some(Some((m, Target::Slot(i)))) => {
+            if open.as_ref() == Some(&(m.clone(), i)) {
+                expose::set_hover(None);
+            } else if open.is_some() {
+                stop_hover(); // already spreading: follow the mouse at once
+                open_expose(m, i);
+            } else if HOVER_TILE.with(|t| t.borrow().as_ref() != Some(&(m.clone(), i))) {
+                HOVER_TILE.with(|t| *t.borrow_mut() = Some((m, i)));
+                unsafe {
+                    SetTimer(Some(APP.get()), HOVER_TIMER, HOVER_MS, None);
+                }
+            }
+            return;
+        }
+        _ => stop_hover(),
+    }
+    if let Some((m, _)) = open {
+        if win::monitor_at(pt).0 != m {
+            expose::collapse(motion_on());
+            arm_anim_timer();
+        } else {
+            expose::set_hover(expose::preview_at(pt));
+        }
+    }
+}
+
+/// The user picked exposé preview `i`: bring its slot and window forward.
+fn choose(i: usize) {
+    let Some((monitor, slot, current, e)) = expose::chosen(i) else { return };
+    if current && !win::is_visible(e.id) {
+        expose::collapse(motion_on()); // the list was stale: it's no longer on screen
+        arm_anim_timer();
+        return;
+    }
+    log!("expose: choose {:x} in {monitor} slot {}", e.id, slot + 1);
+    expose::choose(i, win::frame_rect(e.id), motion_on());
+    arm_anim_timer();
+    if current {
+        win::focus(e.id);
+        return;
+    }
+    let active = STATE.with(|s| s.borrow().active(&monitor)) - 1;
+    let dir = if slot < active { Dir::Prev } else { Dir::Next };
+    switch_with(monitor, dir, Some(e.id), |s, m, visible, now| s.switch_to(m, Target::Slot(slot), visible, now));
+}
+
 /// Hook-driven switches pick the monitor from the posted point, not a fresh cursor read.
 fn switch_at(pt: POINT, dir: Dir) {
     on_switch(win::monitor_at(pt).0, dir);
@@ -286,8 +377,19 @@ fn raise_overlays() {
 /// Shared switch path: write-ahead, hide, show, persist, focus, then panel or OSD.
 /// `dir` is the direction the user moved, for the slide.
 fn run_switch(monitor: String, dir: Dir, pick: impl FnOnce(&mut core::State, &str, Vec<Entry>, u64) -> Option<Plan>) {
+    switch_with(monitor, dir, None, pick);
+}
+
+/// `chosen`: a window picked in the exposé, whose own motion replaces the sheet and which
+/// gets focus instead of the topmost shown window.
+fn switch_with(monitor: String, dir: Dir, chosen: Option<u64>, pick: impl FnOnce(&mut core::State, &str, Vec<Entry>, u64) -> Option<Plan>) {
     if hooks::DRAG.load(SeqCst) {
         return; // never hide the window under a drag
+    }
+    if chosen.is_none() {
+        // never leave a spread sitting under a sheet
+        stop_hover();
+        expose::clear_all();
     }
     let visible = win::visible_windows_on(&monitor);
     let names = win::monitor_names();
@@ -308,7 +410,8 @@ fn run_switch(monitor: String, dir: Dir, pick: impl FnOnce(&mut core::State, &st
     let info = win::monitors().into_iter().find(|m| m.name == monitor);
     let rect = info.as_ref().map_or(RECT::default(), |m| m.rect);
     let t_sheet = std::time::Instant::now();
-    if motion_on()
+    if chosen.is_none()
+        && motion_on()
         && let Some(m) = &info
     {
         let slide = if dir == Dir::Next { anim::Slide::Left } else { anim::Slide::Right };
@@ -332,8 +435,13 @@ fn run_switch(monitor: String, dir: Dir, pick: impl FnOnce(&mut core::State, &st
     let t_hideshow = ms(t);
     gpu::switched(&monitor);
     gpu::go(); // the compositor slides the sheet from here; nothing below can stall it
+    snap::hidden(plan.hide.iter().map(|e| e.id));
+    VISIBLE.with(|v| v.borrow_mut().insert(monitor.clone(), plan.show.clone()));
     persist(&[]);
-    win::focus_after_switch(&shown, &plan.hide);
+    match chosen {
+        Some(id) => win::focus(id),
+        None => win::focus_after_switch(&shown, &plan.hide),
+    }
     let t_focus = ms(t);
     if panel::is_shown() {
         // The new slot's windows are exactly the ones just shown: no need to re-enumerate
@@ -376,6 +484,7 @@ fn do_move(entries: Vec<Entry>, from: String, to: String, target: Target) -> Mov
     let new_rect = if from != to { win::relocate(&entries, &from, &to) } else { None };
     if hide {
         win::hide(&entries);
+        snap::hidden(entries.iter().map(|e| e.id));
     }
     persist(&[]);
     if hide && focused {
@@ -422,6 +531,7 @@ fn panel_data() -> Vec<panel::PanelData> {
         .into_iter()
         .map(|monitor| {
             let visible = win::visible_windows_on(&monitor);
+            VISIBLE.with(|v| v.borrow_mut().insert(monitor.clone(), visible.clone()));
             panel_data_for(monitor, &visible)
         })
         .collect()
@@ -430,6 +540,17 @@ fn panel_data() -> Vec<panel::PanelData> {
 fn show_panels() {
     win::icon_budget(true); // icons are looked up afresh each time the panel opens
     panel::show(&win::monitors(), panel_data());
+    hooks::HOVER.store(true, SeqCst);
+    // Pictures for the exposé, taken now (not at bare Ctrl+Alt: AltGr is Ctrl+Alt).
+    let ids: Vec<u64> = VISIBLE.with(|v| {
+        v.borrow().values().flatten().filter(|e| !e.iconic && win::is_root(e.id)).map(|e| e.id).collect()
+    });
+    snap::start_batch(APP.get(), ids);
+    let mut pt = POINT::default();
+    unsafe {
+        let _ = GetCursorPos(&mut pt);
+    }
+    on_hover(pt); // resting on a tile as the panel appears counts
 }
 
 fn cancel_drag() {
@@ -468,6 +589,16 @@ fn on_tilt(delta: i32, pt: POINT) {
 
 fn on_ldown(pt: POINT) {
     if hooks::DRAG.load(SeqCst) {
+        return;
+    }
+    // The exposé first: its overlay is click-through, so the window under it would start a drag.
+    if let Some(i) = expose::preview_at(pt) {
+        PRESSED_PREVIEW.set(Some(i));
+        return;
+    }
+    if expose::dim_at(pt) {
+        expose::collapse(motion_on());
+        arm_anim_timer();
         return;
     }
     if panel::is_shown()
@@ -509,6 +640,12 @@ fn on_lup(pt: POINT) {
         }
         return;
     }
+    if let Some(i) = PRESSED_PREVIEW.take() {
+        if expose::preview_at(pt) == Some(i) {
+            choose(i);
+        }
+        return;
+    }
     if let Some(Some(pressed)) = PRESSED.with(|p| p.borrow_mut().take())
         && panel::hit(pt) == Some(Some(pressed.clone()))
     {
@@ -519,8 +656,12 @@ fn on_lup(pt: POINT) {
 fn on_move() {
     hooks::MOVE_PENDING.store(false, SeqCst);
     let pt = hooks::unpack(hooks::MOVE_PT.load(SeqCst));
-    panel::ghost_move(pt);
-    panel::set_drop(panel::hit(pt).flatten());
+    if hooks::DRAG.load(SeqCst) {
+        panel::ghost_move(pt);
+        panel::set_drop(panel::hit(pt).flatten());
+    } else if panel::is_shown() {
+        on_hover(pt);
+    }
 }
 
 /// Shows every hidden window and resets to one slot per monitor, keeping the saved layout
@@ -604,6 +745,20 @@ unsafe extern "system" fn app_proc(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) ->
                     let _ = KillTimer(Some(h), ANIM_TIMER);
                 }
             }
+            WM_TIMER if wp.0 == HOVER_TIMER => {
+                let _ = KillTimer(Some(h), HOVER_TIMER);
+                let tile = HOVER_TILE.with(|t| t.borrow_mut().take());
+                let mut pt = POINT::default();
+                let _ = GetCursorPos(&mut pt);
+                if let Some((m, i)) = tile
+                    && panel::is_shown()
+                    && !hooks::DRAG.load(SeqCst)
+                    && panel::hit(pt) == Some(Some((m.clone(), Target::Slot(i))))
+                {
+                    open_expose(m, i);
+                }
+            }
+            snap::WM_SNAPSHOT => expose::snapshots_arrived(snap::drain()),
             WM_TIMER if wp.0 == PANEL_TIMER => {
                 let _ = KillTimer(Some(h), PANEL_TIMER);
                 if hooks::CHORD.load(SeqCst) {
@@ -612,6 +767,17 @@ unsafe extern "system" fn app_proc(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) ->
             }
             hooks::WM_CHORD_UP => {
                 let _ = KillTimer(Some(h), PANEL_TIMER);
+                stop_hover();
+                hooks::HOVER.store(false, SeqCst);
+                // Only a real release chooses (not Ctrl+Alt+Del, an AltGr key, or a reset).
+                match expose::hovered() {
+                    Some(i) if wp.0 == hooks::RELEASED => choose(i),
+                    _ => {
+                        expose::collapse(motion_on());
+                        arm_anim_timer();
+                    }
+                }
+                PRESSED_PREVIEW.set(None);
                 cancel_drag();
                 panel::hide();
                 WHEEL.set(0);

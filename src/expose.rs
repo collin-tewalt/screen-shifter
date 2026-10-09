@@ -1,0 +1,652 @@
+//! The exposé: hovering a slot's tile spreads that slot's windows across its monitor as
+//! previews (snapshots from `snap.rs`), drawn with DirectComposition on an overlay behind the
+//! panel and animated by the compositor. State lives in `gpu::Gpu` (see `State`), so losing
+//! the device drops it with everything else.
+
+use crate::core::Entry;
+use crate::gpu::{self, Gpu, Overlay};
+use crate::win;
+use std::collections::HashMap;
+use windows::Win32::Foundation::{COLORREF, HWND, POINT, RECT};
+use windows::Win32::Graphics::Direct2D::Common::D2D1_BORDER_MODE_HARD;
+use windows::Win32::Graphics::DirectComposition::*;
+use windows::core::Interface;
+use windows::Win32::Graphics::Gdi::*;
+use windows::Win32::UI::WindowsAndMessaging::*;
+use windows::core::w;
+
+const OPEN_MS: u64 = 250;
+const CLOSE_MS: u64 = 180;
+const CHOOSE_MS: u64 = 220;
+/// Darkening without a frosted backdrop (it couldn't be captured), and with one.
+const DIM: f32 = 0.45;
+const TINT: f32 = 0.3;
+/// Backdrop blur (standard deviation, px).
+const BLUR: f32 = 28.0;
+const GAP: f32 = 32.0;
+const MARGIN: f32 = 48.0;
+const HIGHLIGHT: f32 = 4.0;
+const ACCENT: u32 = 0xFF00_78D7; // BGRA of the panel accent
+/// Cards (windows without a picture) are drawn this wide, at the window's aspect.
+const CARD_W: i32 = 320;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct Rect {
+    pub x: f32,
+    pub y: f32,
+    pub w: f32,
+    pub h: f32,
+}
+
+impl Rect {
+    fn contains(&self, x: f32, y: f32) -> bool {
+        x >= self.x && x < self.x + self.w && y >= self.y && y < self.y + self.h
+    }
+
+    /// The largest rect of aspect `w`:`h` centered inside this one.
+    fn fit(&self, w: f32, h: f32) -> Rect {
+        let k = (self.w / w).min(self.h / h);
+        let (fw, fh) = (w * k, h * k);
+        Rect { x: self.x + (self.w - fw) / 2.0, y: self.y + (self.h - fh) / 2.0, w: fw, h: fh }
+    }
+}
+
+/// Lays out windows of the given sizes in reading order: the column count that gives the
+/// most preview area wins; previews keep their aspect, never grow past real size, and are
+/// centered in their cells; a short last row is centered.
+pub fn grid(sizes: &[(f32, f32)], area: Rect, gap: f32) -> Vec<Rect> {
+    let n = sizes.len();
+    let scale = |(w, h): (f32, f32), cw: f32, ch: f32| (cw / w).min(ch / h).min(1.0);
+    let mut best: Option<(f32, usize)> = None;
+    for c in 1..=n {
+        let r = n.div_ceil(c);
+        let cw = (area.w - gap * (c - 1) as f32) / c as f32;
+        let ch = (area.h - gap * (r - 1) as f32) / r as f32;
+        if cw <= 0.0 || ch <= 0.0 {
+            continue;
+        }
+        let total: f32 = sizes.iter().map(|&s| scale(s, cw, ch).powi(2) * s.0 * s.1).sum();
+        if best.is_none_or(|(t, _)| total > t) {
+            best = Some((total, c));
+        }
+    }
+    let Some((_, c)) = best else { return vec![] };
+    let r = n.div_ceil(c);
+    let cw = (area.w - gap * (c - 1) as f32) / c as f32;
+    let ch = (area.h - gap * (r - 1) as f32) / r as f32;
+    sizes
+        .iter()
+        .enumerate()
+        .map(|(i, &(w, h))| {
+            let (row, col) = (i / c, i % c);
+            let in_row = (n - row * c).min(c);
+            let shift = (c - in_row) as f32 * (cw + gap) / 2.0;
+            let cell = Rect { x: area.x + shift + col as f32 * (cw + gap), y: area.y + row as f32 * (ch + gap), w: cw, h: ch };
+            let k = scale((w, h), cw, ch);
+            let (pw, ph) = (w * k, h * k);
+            Rect { x: cell.x + (cw - pw) / 2.0, y: cell.y + (ch - ph) / 2.0, w: pw, h: ph }
+        })
+        .collect()
+}
+
+struct Preview {
+    id: u64,
+    visual: IDCompositionVisual2,
+    scale: IDCompositionScaleTransform,
+    fx: IDCompositionEffectGroup,
+    /// content size in pixels
+    sw: f32,
+    sh: f32,
+    /// where it grows out of and folds back to
+    home: Rect,
+    cell: Rect,
+    from_tile: bool,
+}
+
+struct Set {
+    monitor: String,
+    slot: usize,
+    current: bool,
+    mon: RECT,
+    root: IDCompositionVisual2,
+    dim: IDCompositionEffectGroup,
+    dim_to: f32,
+    /// The frosted monitor picture: its blur, and its opacity.
+    backdrop: Option<(IDCompositionGaussianBlurEffect, IDCompositionEffectGroup)>,
+    highlight: (IDCompositionVisual2, IDCompositionScaleTransform, IDCompositionEffectGroup),
+    previews: Vec<Preview>,
+    entries: Vec<Entry>,
+    /// When a closing set's motion is over and it can be removed.
+    ends: u64,
+}
+
+#[derive(Default)]
+pub struct State {
+    overlays: Vec<Overlay>,
+    /// Pictures on the GPU, by window (grid size, full resolution); replaced by newer ones.
+    surfaces: HashMap<u64, (Pic, Option<Pic>)>,
+    cards: HashMap<u64, (IDCompositionSurface, f32, f32)>,
+    open: Option<Set>,
+    closing: Vec<Set>,
+    hovered: Option<usize>,
+}
+
+impl State {
+    pub fn overlays(&self) -> impl Iterator<Item = &Overlay> {
+        self.overlays.iter()
+    }
+}
+
+type R<T> = windows::core::Result<T>;
+/// A picture on the GPU and its size in pixels.
+type Pic = (IDCompositionSurface, f32, f32);
+
+fn client(r: RECT, mon: RECT) -> Rect {
+    Rect { x: (r.left - mon.left) as f32, y: (r.top - mon.top) as f32, w: (r.right - r.left) as f32, h: (r.bottom - r.top) as f32 }
+}
+
+/// Values of one transition, sharing a begin time; `dur == 0` sets them at once.
+struct Tx {
+    dcomp: IDCompositionDesktopDevice,
+    begin: i64,
+    begin_ms: u64,
+    dur: u64,
+}
+
+impl Tx {
+    fn new(g: &Gpu, dur: u64) -> R<Tx> {
+        let (begin, begin_ms) = gpu::begin_time(&g.dcomp, 0)?;
+        Ok(Tx { dcomp: g.dcomp.clone(), begin, begin_ms, dur })
+    }
+
+    fn anim(&self, from: f32, to: f32) -> R<IDCompositionAnimation> {
+        let m = crate::anim::Motion { from, to, start: self.begin_ms, dur: self.dur };
+        gpu::animation(&self.dcomp, &m, self.begin)
+    }
+
+    fn rect(&self, p: &Preview, from: Rect, to: Rect) -> R<()> {
+        unsafe {
+            if self.dur == 0 {
+                p.visual.SetOffsetX2(to.x)?;
+                p.visual.SetOffsetY2(to.y)?;
+                p.scale.SetScaleX2(to.w / p.sw)?;
+                return p.scale.SetScaleY2(to.h / p.sh);
+            }
+            p.visual.SetOffsetX(&self.anim(from.x, to.x)?)?;
+            p.visual.SetOffsetY(&self.anim(from.y, to.y)?)?;
+            p.scale.SetScaleX(&self.anim(from.w / p.sw, to.w / p.sw)?)?;
+            p.scale.SetScaleY(&self.anim(from.h / p.sh, to.h / p.sh)?)
+        }
+    }
+
+    fn opacity(&self, fx: &IDCompositionEffectGroup, from: f32, to: f32) -> R<()> {
+        unsafe { if self.dur == 0 { fx.SetOpacity2(to) } else { fx.SetOpacity(&self.anim(from, to)?) } }
+    }
+}
+
+/// Adds `child` in front of everything `parent` already holds (`top` = its frontmost child,
+/// updated). AddVisual without a reference puts `insertAbove = true` at the *bottom*.
+fn stack(parent: &IDCompositionVisual2, child: &IDCompositionVisual2, top: &mut Option<IDCompositionVisual2>) -> R<()> {
+    unsafe {
+        match top {
+            Some(t) => parent.AddVisual(child, true, &*t)?,
+            None => parent.AddVisual(child, false, None::<&IDCompositionVisual>)?,
+        }
+    }
+    *top = Some(child.clone());
+    Ok(())
+}
+
+/// A 1×1 surface of one color, stretched by a scale transform.
+fn solid(g: &Gpu, bgra: u32) -> R<IDCompositionSurface> {
+    gpu::surface_from_pixels(g, 1, 1, &[bgra], true)
+}
+
+/// A card for a window without a picture: its icon and title, at the window's aspect.
+fn card_pixels(id: u64, aspect: f32) -> (i32, i32, Vec<u32>) {
+    let (w, h) = (CARD_W, ((CARD_W as f32 / aspect) as i32).clamp(120, 480));
+    unsafe {
+        let screen = GetDC(None);
+        let dc = CreateCompatibleDC(Some(screen));
+        let bi = BITMAPINFO {
+            bmiHeader: BITMAPINFOHEADER { biSize: size_of::<BITMAPINFOHEADER>() as u32, biWidth: w, biHeight: -h, biPlanes: 1, biBitCount: 32, ..Default::default() },
+            ..Default::default()
+        };
+        let mut bits = std::ptr::null_mut();
+        let mut px = vec![0xFF2B_2B2B; (w * h) as usize];
+        if let Ok(bmp) = CreateDIBSection(Some(screen), &bi, DIB_RGB_COLORS, &mut bits, None, 0) {
+            let old = SelectObject(dc, bmp.into());
+            let bg = CreateSolidBrush(COLORREF(0x002B2B2B));
+            FillRect(dc, &RECT { left: 0, top: 0, right: w, bottom: h }, bg);
+            let _ = DeleteObject(bg.into());
+            let icon = win::icon_of(id);
+            let size = 48;
+            let iy = h / 2 - size;
+            if !icon.is_invalid() {
+                let _ = DrawIconEx(dc, (w - size) / 2, iy, icon, size, size, 0, None, DI_NORMAL);
+            }
+            let font = CreateFontW(20, 0, 0, 0, FW_NORMAL.0 as i32, 0, 0, 0, DEFAULT_CHARSET, OUT_DEFAULT_PRECIS,
+                CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY, 0, w!("Segoe UI"));
+            let old_font = SelectObject(dc, font.into());
+            SetTextColor(dc, COLORREF(0x00F0F0F0));
+            SetBkMode(dc, TRANSPARENT);
+            let mut text: Vec<u16> = win::title_of(win::hwnd(id)).encode_utf16().collect();
+            let mut tr = RECT { left: 12, top: iy + size + 12, right: w - 12, bottom: h - 8 };
+            DrawTextW(dc, &mut text, &mut tr, DT_CENTER | DT_WORDBREAK | DT_END_ELLIPSIS | DT_NOPREFIX);
+            SelectObject(dc, old_font);
+            let _ = DeleteObject(font.into());
+            let src = std::slice::from_raw_parts(bits as *const u32, (w * h) as usize);
+            px = src.iter().map(|p| p | 0xFF00_0000).collect(); // GDI leaves alpha at 0
+            SelectObject(dc, old);
+            let _ = DeleteObject(bmp.into());
+        }
+        let _ = DeleteDC(dc);
+        ReleaseDC(None, screen);
+        (w, h, px)
+    }
+}
+
+/// The window's grid picture, or a card.
+fn content(g: &mut Gpu, id: u64, aspect: f32) -> R<Pic> {
+    if let Some((s, _)) = g.expose.surfaces.get(&id) {
+        return Ok(s.clone());
+    }
+    if let Some(s) = g.expose.cards.get(&id) {
+        return Ok(s.clone());
+    }
+    let (w, h, px) = card_pixels(id, aspect);
+    let s = (gpu::surface_from_pixels(g, w, h, &px, false)?, w as f32, h as f32);
+    g.expose.cards.insert(id, s.clone());
+    Ok(s)
+}
+
+/// Spreads `entries` (a slot's root windows, topmost first) across `monitor`. `tile`: the
+/// hovered tile's screen rect (hidden slots grow out of it). Any open spread collapses.
+pub fn open(monitor: &str, slot: usize, current: bool, entries: &[Entry], tile: Option<RECT>, motion: bool) -> bool {
+    let Some(m) = win::monitors().into_iter().find(|m| m.name == monitor) else { return false };
+    let Some((panel_hwnd, panel_rect)) = crate::panel::window_of(monitor) else { return false };
+    let roots: Vec<(Entry, RECT)> = entries.iter().filter_map(|e| Some((e.clone(), win::frame_rect(e.id)?))).collect();
+    if roots.is_empty() {
+        collapse(motion);
+        return false;
+    }
+    gpu::with(monitor, |g| {
+        collapse_in(g, motion)?;
+        open_in(g, monitor, slot, current, &roots, tile, m.rect, m.work, panel_hwnd, panel_rect, m.scale, motion)
+    })
+    .is_some()
+}
+
+#[allow(clippy::too_many_arguments)]
+fn open_in(g: &mut Gpu, monitor: &str, slot: usize, current: bool, roots: &[(Entry, RECT)], tile: Option<RECT>,
+    mon: RECT, work: RECT, panel_hwnd: HWND, panel_rect: RECT, scale: f32, motion: bool) -> R<()> {
+    if !g.expose.overlays.iter().any(|o| o.monitor == monitor) {
+        let o = gpu::make_overlay(&g.dcomp, monitor, mon)?;
+        g.expose.overlays.push(o);
+    }
+    let margin = MARGIN * scale;
+    let area = Rect {
+        x: (work.left - mon.left) as f32 + margin,
+        y: (work.top - mon.top) as f32 + margin,
+        w: (work.right - work.left) as f32 - 2.0 * margin,
+        h: (panel_rect.top - work.top) as f32 - 2.0 * margin,
+    };
+    let sizes: Vec<(f32, f32)> = roots.iter().map(|(_, r)| (((r.right - r.left).max(1)) as f32, ((r.bottom - r.top).max(1)) as f32)).collect();
+    let cells = grid(&sizes, area, GAP * scale);
+    let tile = tile.map(|t| client(t, mon));
+    unsafe {
+        let root = g.dcomp.CreateVisual()?;
+        let tx = Tx::new(g, if motion { OPEN_MS } else { 0 })?;
+        let mut top = None; // back to front: backdrop, tint, highlight, previews
+
+        // Frosted backdrop: the monitor's own picture, blurring in (GPU capture, 5-10 ms).
+        let backdrop = match gpu::capture_monitor(g, monitor, mon)? {
+            Some(pic) => {
+                let outer = g.dcomp.CreateVisual()?;
+                let fx = g.dcomp.CreateEffectGroup()?;
+                fx.SetOpacity2(1.0)?;
+                outer.SetEffect(&fx)?;
+                let inner = g.dcomp.CreateVisual()?;
+                inner.SetContent(&pic)?;
+                let blur = g.dcomp.cast::<IDCompositionDevice3>()?.CreateGaussianBlurEffect()?;
+                blur.SetBorderMode(D2D1_BORDER_MODE_HARD)?; // no dark fringe at the monitor edges
+                if tx.dur == 0 { blur.SetStandardDeviation2(BLUR)? } else { blur.SetStandardDeviation(&tx.anim(0.0, BLUR)?)? }
+                inner.SetEffect(&blur)?;
+                outer.AddVisual(&inner, false, None::<&IDCompositionVisual>)?;
+                stack(&root, &outer, &mut top)?;
+                Some((blur, fx))
+            }
+            None => None,
+        };
+        let dim_to = if backdrop.is_some() { TINT } else { DIM };
+
+        let dim_v = g.dcomp.CreateVisual()?;
+        dim_v.SetContent(&solid(g, 0xFF00_0000)?)?;
+        let dim_scale = g.dcomp.CreateScaleTransform()?;
+        dim_scale.SetScaleX2((mon.right - mon.left) as f32)?;
+        dim_scale.SetScaleY2((mon.bottom - mon.top) as f32)?;
+        dim_v.SetTransform(&dim_scale)?;
+        let dim = g.dcomp.CreateEffectGroup()?;
+        tx.opacity(&dim, 0.0, dim_to)?;
+        dim_v.SetEffect(&dim)?;
+        stack(&root, &dim_v, &mut top)?;
+
+        let hl_v = g.dcomp.CreateVisual()?;
+        hl_v.SetContent(&solid(g, ACCENT)?)?;
+        let hl_scale = g.dcomp.CreateScaleTransform()?;
+        hl_v.SetTransform(&hl_scale)?;
+        let hl_fx = g.dcomp.CreateEffectGroup()?;
+        hl_fx.SetOpacity2(0.0)?;
+        hl_v.SetEffect(&hl_fx)?;
+        stack(&root, &hl_v, &mut top)?;
+
+        let mut previews = vec![];
+        for ((e, r), cell) in roots.iter().zip(cells) {
+            let (surface, sw, sh) = content(g, e.id, cell.w / cell.h)?;
+            let visual = g.dcomp.CreateVisual()?;
+            visual.SetContent(&surface)?;
+            let st = g.dcomp.CreateScaleTransform()?;
+            visual.SetTransform(&st)?;
+            let fx = g.dcomp.CreateEffectGroup()?;
+            visual.SetEffect(&fx)?;
+            stack(&root, &visual, &mut top)?;
+            let (home, from_tile) = match (current, tile) {
+                (false, Some(t)) => (t.fit(cell.w, cell.h), true),
+                _ => (client(*r, mon), false),
+            };
+            let p = Preview { id: e.id, visual, scale: st, fx, sw, sh, home, cell, from_tile };
+            tx.rect(&p, home, cell)?;
+            tx.opacity(&p.fx, if from_tile { 0.0 } else { 1.0 }, 1.0)?;
+            previews.push(p);
+        }
+        let overlay = g.expose.overlays.iter().find(|o| o.monitor == monitor).expect("made above");
+        // In front of any spread still folding away on this monitor.
+        let mut front = g.expose.closing.iter().rev().find(|s| s.monitor == monitor).map(|s| s.root.clone());
+        stack(&overlay.root, &root, &mut front)?;
+        g.dcomp.Commit()?;
+        // Directly behind the panel: above every other window, never above the panel.
+        let _ = SetWindowPos(overlay.hwnd, Some(panel_hwnd), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+        g.expose.open = Some(Set {
+            monitor: monitor.to_string(), slot, current, mon, root, dim, dim_to, backdrop, highlight: (hl_v, hl_scale, hl_fx), previews,
+            entries: roots.iter().map(|(e, _)| e.clone()).collect(), ends: 0,
+        });
+        g.expose.hovered = None;
+    }
+    Ok(())
+}
+
+/// Folds the open spread back (to its windows, or into its tile) and fades the dimming.
+pub fn collapse(motion: bool) {
+    gpu::with_existing(|g| collapse_in(g, motion));
+}
+
+fn collapse_in(g: &mut Gpu, motion: bool) -> R<()> {
+    let Some(mut set) = g.expose.open.take() else { return Ok(()) };
+    g.expose.hovered = None;
+    let dur = if motion { CLOSE_MS } else { 0 };
+    let tx = Tx::new(g, dur)?;
+    unsafe {
+        tx.opacity(&set.dim, set.dim_to, 0.0)?;
+        if let Some((blur, _)) = &set.backdrop {
+            if dur == 0 { blur.SetStandardDeviation2(0.0)? } else { blur.SetStandardDeviation(&tx.anim(BLUR, 0.0)?)? }
+        }
+        set.highlight.2.SetOpacity2(0.0)?;
+        for p in &set.previews {
+            tx.rect(p, p.cell, p.home)?;
+            if p.from_tile {
+                tx.opacity(&p.fx, 1.0, 0.0)?;
+            }
+        }
+        g.dcomp.Commit()?;
+    }
+    set.ends = tx.begin_ms + dur;
+    g.expose.closing.push(set);
+    Ok(())
+}
+
+/// What choosing preview `i` means: (monitor, slot, slot is current, window).
+pub fn chosen(i: usize) -> Option<(String, usize, bool, Entry)> {
+    gpu::with_existing(|g| {
+        // previews and entries are in the same order
+        Ok(g.expose.open.as_ref().and_then(|s| Some((s.monitor.clone(), s.slot, s.current, s.entries.get(i)?.clone()))))
+    })
+    .flatten()
+}
+
+/// The chosen preview flies onto its window (`target`, screen) or fades; the rest fade.
+pub fn choose(i: usize, target: Option<RECT>, motion: bool) {
+    gpu::with_existing(|g| {
+        let Some(mut set) = g.expose.open.take() else { return Ok(()) };
+        g.expose.hovered = None;
+        let dur = if motion { CHOOSE_MS } else { 0 };
+        let tx = Tx::new(g, dur)?;
+        unsafe {
+            tx.opacity(&set.dim, set.dim_to, 0.0)?;
+            // The slot underneath may change: fade the old picture rather than unblur it.
+            if let Some((_, fx)) = &set.backdrop {
+                tx.opacity(fx, 1.0, 0.0)?;
+            }
+            set.highlight.2.SetOpacity2(0.0)?;
+            for (k, p) in set.previews.iter_mut().enumerate() {
+                match target.filter(|_| k == i) {
+                    Some(t) => {
+                        // Land on the window at full resolution: no blurry moment at the end.
+                        if let Some(Some((full, fw, fh))) = g.expose.surfaces.get(&p.id).map(|(_, f)| f.clone()) {
+                            p.visual.SetContent(&full)?;
+                            (p.sw, p.sh) = (fw, fh);
+                        }
+                        tx.rect(p, p.cell, client(t, set.mon))?
+                    }
+                    None => tx.opacity(&p.fx, 1.0, 0.0)?,
+                }
+            }
+            g.dcomp.Commit()?;
+        }
+        set.ends = tx.begin_ms + dur;
+        g.expose.closing.push(set);
+        Ok(())
+    });
+}
+
+/// The open spread's monitor and slot.
+pub fn open_slot() -> Option<(String, usize)> {
+    gpu::with_existing(|g| Ok(g.expose.open.as_ref().map(|s| (s.monitor.clone(), s.slot)))).flatten()
+}
+
+/// Index of the preview under a screen point.
+pub fn preview_at(pt: POINT) -> Option<usize> {
+    gpu::with_existing(|g| {
+        Ok(g.expose.open.as_ref().and_then(|s| {
+            let (x, y) = ((pt.x - s.mon.left) as f32, (pt.y - s.mon.top) as f32);
+            s.previews.iter().rposition(|p| p.cell.contains(x, y))
+        }))
+    })
+    .flatten()
+}
+
+/// On the open spread's monitor but not on a preview or the panel.
+pub fn dim_at(pt: POINT) -> bool {
+    let Some((monitor, _)) = open_slot() else { return false };
+    let on_mon = gpu::with_existing(|g| {
+        Ok(g.expose.open.as_ref().is_some_and(|s| {
+            pt.x >= s.mon.left && pt.x < s.mon.right && pt.y >= s.mon.top && pt.y < s.mon.bottom
+        }))
+    })
+    .unwrap_or(false);
+    let on_panel = crate::panel::window_of(&monitor).is_some_and(|(_, r)| pt.x >= r.left && pt.x < r.right && pt.y >= r.top && pt.y < r.bottom);
+    on_mon && !on_panel && preview_at(pt).is_none()
+}
+
+pub fn hovered() -> Option<usize> {
+    gpu::with_existing(|g| Ok(g.expose.open.as_ref().and(g.expose.hovered))).flatten()
+}
+
+/// Highlights preview `i` (None: no highlight).
+pub fn set_hover(i: Option<usize>) {
+    gpu::with_existing(|g| {
+        if g.expose.hovered == i {
+            return Ok(());
+        }
+        let Some(set) = g.expose.open.as_ref() else { return Ok(()) };
+        let (v, st, fx) = &set.highlight;
+        unsafe {
+            match i.and_then(|i| set.previews.get(i)) {
+                Some(p) => {
+                    let c = p.cell;
+                    v.SetOffsetX2(c.x - HIGHLIGHT)?;
+                    v.SetOffsetY2(c.y - HIGHLIGHT)?;
+                    st.SetScaleX2(c.w + 2.0 * HIGHLIGHT)?;
+                    st.SetScaleY2(c.h + 2.0 * HIGHLIGHT)?;
+                    fx.SetOpacity2(1.0)?;
+                }
+                None => fx.SetOpacity2(0.0)?,
+            }
+            g.dcomp.Commit()?;
+        }
+        g.expose.hovered = i;
+        Ok(())
+    });
+}
+
+/// New pictures arrived: upload them (the CPU copies are dropped), and swap them into an
+/// open spread (replacing cards).
+pub fn snapshots_arrived(shots: Vec<crate::snap::Shot>) {
+    let Some(any_monitor) = win::monitor_names().into_iter().next() else { return };
+    if shots.is_empty() {
+        return;
+    }
+    gpu::with(&any_monitor, |g| {
+        let mut changed = false;
+        let upload = |g: &Gpu, p: &crate::snap::Pic| -> R<Pic> {
+            Ok((gpu::surface_from_pixels(g, p.w, p.h, &p.pixels, false)?, p.w as f32, p.h as f32))
+        };
+        for shot in shots {
+            let id = shot.id;
+            let s = upload(g, &shot.grid)?;
+            let full = shot.full.as_ref().map(|p| upload(g, p)).transpose()?;
+            g.expose.cards.remove(&id);
+            g.expose.surfaces.insert(id, (s.clone(), full));
+            if let Some(set) = g.expose.open.as_mut()
+                && let Some(p) = set.previews.iter_mut().find(|p| p.id == id)
+            {
+                unsafe { p.visual.SetContent(&s.0)? };
+                (p.sw, p.sh) = (s.1, s.2);
+                let tx = Tx { dcomp: g.dcomp.clone(), begin: 0, begin_ms: 0, dur: 0 };
+                tx.rect(p, p.cell, p.cell)?;
+                changed = true;
+            }
+        }
+        g.expose.surfaces.retain(|&id, _| unsafe { IsWindow(Some(win::hwnd(id))).as_bool() });
+        g.expose.cards.retain(|&id, _| unsafe { IsWindow(Some(win::hwnd(id))).as_bool() });
+        if changed {
+            unsafe { g.dcomp.Commit()? };
+        }
+        Ok(())
+    });
+}
+
+/// Removes closed spreads whose motion is over. True while any spread exists.
+pub fn reap(now: u64) -> bool {
+    gpu::with_existing(|g| {
+        let (gone, keep): (Vec<_>, Vec<_>) = std::mem::take(&mut g.expose.closing).into_iter().partition(|s| now >= s.ends + 50);
+        g.expose.closing = keep;
+        if !gone.is_empty() {
+            remove(g, &gone)?;
+        }
+        Ok(g.expose.open.is_some() || !g.expose.closing.is_empty())
+    })
+    .unwrap_or(false)
+}
+
+pub fn any() -> bool {
+    gpu::with_existing(|g| Ok(g.expose.open.is_some() || !g.expose.closing.is_empty())).unwrap_or(false)
+}
+
+/// Removes every spread at once (monitor change, Restore all, Exit, a switch).
+pub fn clear_all() {
+    gpu::with_existing(|g| {
+        let mut gone = std::mem::take(&mut g.expose.closing);
+        gone.extend(g.expose.open.take());
+        g.expose.hovered = None;
+        remove(g, &gone)
+    });
+}
+
+fn remove(g: &Gpu, gone: &[Set]) -> R<()> {
+    unsafe {
+        for s in gone {
+            if let Some(o) = g.expose.overlays.iter().find(|o| o.monitor == s.monitor) {
+                let _ = o.root.RemoveVisual(&s.root);
+            }
+        }
+        g.dcomp.Commit()?;
+        for o in &g.expose.overlays {
+            let live = g.expose.open.iter().chain(&g.expose.closing).any(|s| s.monitor == o.monitor);
+            if !live {
+                let _ = ShowWindow(o.hwnd, SW_HIDE);
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const AREA: Rect = Rect { x: 48.0, y: 48.0, w: 2464.0, h: 1100.0 };
+
+    fn check(sizes: &[(f32, f32)]) -> Vec<Rect> {
+        let cells = grid(sizes, AREA, 32.0);
+        assert_eq!(cells.len(), sizes.len());
+        for (i, (c, &(w, h))) in cells.iter().zip(sizes).enumerate() {
+            assert!(c.x >= AREA.x - 0.01 && c.y >= AREA.y - 0.01, "{i} inside (top-left)");
+            assert!(c.x + c.w <= AREA.x + AREA.w + 0.01 && c.y + c.h <= AREA.y + AREA.h + 0.01, "{i} inside (bottom-right)");
+            assert!(c.w <= w + 0.01 && c.h <= h + 0.01, "{i} never enlarged");
+            assert!((c.w / c.h - w / h).abs() < 0.01, "{i} keeps aspect");
+            for (j, d) in cells.iter().enumerate().skip(i + 1) {
+                let apart = c.x + c.w <= d.x || d.x + d.w <= c.x || c.y + c.h <= d.y || d.y + d.h <= c.y;
+                assert!(apart, "{i} and {j} overlap");
+            }
+        }
+        cells
+    }
+
+    #[test]
+    fn one_window_is_centered_and_not_enlarged() {
+        let c = check(&[(800.0, 600.0)]);
+        assert_eq!((c[0].w, c[0].h), (800.0, 600.0));
+        assert!((c[0].x + c[0].w / 2.0 - (AREA.x + AREA.w / 2.0)).abs() < 0.01);
+    }
+
+    #[test]
+    fn big_windows_shrink_to_fit() {
+        let c = check(&[(2560.0, 1400.0), (2560.0, 1400.0)]);
+        assert!(c[0].w < 2560.0);
+        assert!((c[0].y - c[1].y).abs() < 0.01, "two wide windows side by side");
+    }
+
+    #[test]
+    fn mixes_and_many() {
+        check(&[(2560.0, 1400.0), (600.0, 1200.0), (1200.0, 800.0), (400.0, 300.0), (1920.0, 1080.0)]);
+        let many: Vec<(f32, f32)> = (0..24).map(|i| (800.0 + i as f32 * 40.0, 600.0)).collect();
+        check(&many);
+    }
+
+    #[test]
+    fn short_last_row_is_centered() {
+        let c = check(&[(1200.0, 900.0); 5]);
+        let last = c.last().unwrap();
+        let first_row_y = c[0].y;
+        if (last.y - first_row_y).abs() > 1.0 {
+            let row: Vec<&Rect> = c.iter().filter(|r| (r.y - last.y).abs() < 1.0).collect();
+            let mid = (row.first().unwrap().x + row.last().unwrap().x + row.last().unwrap().w) / 2.0;
+            assert!((mid - (AREA.x + AREA.w / 2.0)).abs() < 1.0);
+        }
+    }
+
+    #[test]
+    fn empty() {
+        assert!(grid(&[], AREA, 32.0).is_empty());
+    }
+}

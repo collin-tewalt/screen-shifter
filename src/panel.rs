@@ -215,6 +215,11 @@ pub fn tile_screen_rect(monitor: &str, slot: usize) -> Option<RECT> {
     })
 }
 
+/// The panel window and its screen rect on `monitor`, if shown.
+pub fn window_of(monitor: &str) -> Option<(HWND, RECT)> {
+    PANELS.with(|p| p.borrow().iter().find(|p| p.data.monitor == monitor).map(|p| (p.hwnd, p.rect)))
+}
+
 /// Every visible overlay that must stay above switch sheets.
 pub fn overlay_hwnds() -> Vec<HWND> {
     let mut v: Vec<HWND> = PANELS.with(|p| p.borrow().iter().map(|p| p.hwnd).collect());
