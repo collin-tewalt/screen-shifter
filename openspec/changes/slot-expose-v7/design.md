@@ -6,7 +6,7 @@ v6 gives us a D3D11 + DirectComposition device (`gpu.rs`), per-monitor click-thr
 
 **Goals:** previews of any slot's windows on hover, choosing one, smooth open/close/choose motion, no stall of the UI thread or the switch.
 
-**Non-Goals:** live previews, drag between slots from the exposé, keyboard navigation, the exposé without the GPU path.
+**Non-Goals:** live previews, keyboard navigation, the exposé without the GPU path.
 
 ## Decisions
 
@@ -94,6 +94,28 @@ Removal after a transition rides the existing `ANIM_TIMER` (as v6 sheets): the t
 
 - **Frosted backdrop:** a plain dim didn't make the previews stand out. DirectComposition can't blur what's behind a window, but we can capture the monitor (the v6 Desktop Duplication path, 5–10 ms) and show that picture under the previews with a Gaussian blur whose standard deviation animates 0 → 28 px while a tint fades to 0.3 (0.45 without a backdrop). Collapse animates the blur back to 0 (the picture becomes the live screen again); choose fades the backdrop out instead (the slot underneath changes). Filter effects need the newer composition device, so `gpu.rs` now creates it with `DCompositionCreateDevice3` (`IDCompositionDesktopDevice`, visuals are `IDCompositionVisual2`); sheets are unaffected. Capture failure → plain dim.
 - **Sharp landing on choose:** grid previews use a ≤ 800 px picture (crisp when small); flying that up to full size showed a blurry moment before the real window took over. The worker now also keeps the full-resolution frame (≤ 4096 px), both are uploaded to the GPU as they arrive (CPU copies dropped; nothing stored on the CPU any more), and the chosen preview switches to the full-resolution surface as it starts flying. Cost: GPU memory, ~15 MB per captured 2560×1440 window, dropped when the window closes or the device is lost (then cards until the next capture).
+
+### 11. Dragging a preview to a slot (added after first use)
+
+- **Start:** a left-down on a preview remembers it; a move of more than 6 px (scaled) with the button still down starts a preview drag (`hooks::DRAG` is set so switches are blocked, as during a window drag; moves already arrive while the panel is up). Releasing without moving still chooses (§8).
+- **Lift and follow:** the preview's scale transform gets its center at the grab point `c` (content pixels). With that center, the screen position of the grab point is `offset + c` whatever the scale, so the scale animates from the cell size to ghost size (fits 360×240, scaled; 150 ms) while every move just sets `offset = cursor − c` statically: the preview shrinks around the cursor and follows it without fighting its own animation. General rect placement with a center: `offset = rect.x − c + c·s`, `s = rect.w / sw` (center 0 reduces to §5).
+- **Drag layer:** the spread's overlay sits behind the panel and covers one monitor, so a dragged preview would vanish over the tiles and at the monitor edge. At lift the preview's visual is re-parented (same device) into a **drag overlay**: one more click-through, capture-excluded window spanning the bounding rect of all monitors, kept topmost above the panels while a drag is on. Its offsets are in that rect's coordinates (cursor − union origin − c). Spring-back re-parents it into its set again (in that monitor's client coordinates) and animates from where it is to its cell; a preview flying into a tile stays on the drag layer and is removed when its fade ends (reaped like closing sets).
+- **Targets:** panel tiles only, highlighted with the existing `panel::set_drop`. The spread stays open while dragging, even over the other monitor. The dragged preview is excluded from hit testing and the hover highlight is hidden while dragging.
+- **Drop on a tile:** `do_move(group, spread monitor, source slot, tile monitor, target)`, where `group` is the window plus its owned windows from the spread's source list (current slot: the visible list; hidden slot: the slot's entries). **`core::move_to_slot` learns where the window is:** `in_slot: Option<usize>` (None = on screen in `from`'s current slot, as for window drags; Some(i) = hidden in `from`'s slot i). It rejects only a drop onto the window's own slot (`from == to && target == in_slot or current`); a hidden window dropped on any current slot, its own monitor's included, is `Visible`. Results:
+  - `Hidden(slot)`: the preview flies into the tile (inset), fading out; the tile pulses.
+  - `Relocated(rect)`: flies to the window's new rect on the other monitor and fades.
+  - `Nothing` (its own slot, or stale): springs back to its cell.
+  A dropped preview stays in the set, faded and ignored by hit testing (no reflow of the others); when no live preview is left, the spread collapses. The moved group is removed from the spread monitor's visible list after the drop (the re-enumeration in `do_move` can still see it before the async hide lands).
+- **Moving a hidden window** (new for the move path, which so far only moved visible windows):
+  - to a monitor's *current* slot: after relocating, `win::show` the group (it's hidden);
+  - across monitors into a *hidden* slot: relocation must not show it. `relocate` gets an explicit `keep_hidden` flag (set only for this case; *not* derived from `IsWindowVisible`, which is still false for a window `win::show` just queued, so a derived rule would re-hide shows) that makes `set_placement_async` use `SW_HIDE` (checked before the minimized/maximized cases; it updates `rcNormalPosition` and keeps the min/max state). A maximized hidden window is also moved with `SetWindowPos` (async, no activation, no show) to the target work area plus its current overhang (`GetWindowRect` − source work area, applied to the target's), since its maximized rect isn't re-derived until it's shown.
+- **Cancel:** drop anywhere but a tile, `Ctrl+Alt` released (any reason), or the panel hiding → springs back, `hooks::DRAG` cleared, `set_drop(None)`. On `WM_CHORD_UP` the preview drag is cancelled **first**, then the spread collapses; a release during a drag never chooses.
+- `on_move` with a preview drag routes to the drag code (not the window-drag ghost).
+- **After a drop the spread stays put:** the cursor ends on the drop tile (maybe on the other monitor), which the §7 hover rules would read as "swap" or "collapse". So a drop sets a *drop hold*: until the cursor is back on the spread's monitor away from the tiles, hovering the drop tile counts as the open spread and being on the other monitor doesn't collapse it. Hovering a *different* tile ends the hold and swaps as usual. This keeps several windows draggable out of one spread.
+- After any successful drop, collapsing **fades** the backdrop instead of un-blurring it (the frozen picture still shows the moved window).
+- Display change / device loss / Restore all / Exit also cancel a preview drag (clear `hooks::DRAG`, drop state), like they clear the exposé.
+- A spring-back during the 150 ms lift snaps the scale to the computed current value (from elapsed time and the easing).
+- Panel tiles are refreshed by `do_move` as for any move; the visible lists are refreshed from the same enumeration (§7).
 
 ## Risks / Trade-offs
 

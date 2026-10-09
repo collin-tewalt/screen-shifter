@@ -292,6 +292,11 @@ fn classify(h: HWND) -> Result<String, &'static str> {
     }
 }
 
+/// The window at the top of `id`'s owner chain (itself if it isn't owned).
+pub fn root_of(id: u64) -> u64 {
+    unsafe { GetAncestor(hwnd(id), GA_ROOTOWNER).0 as u64 }
+}
+
 /// True for a top-level window that isn't owned by another (not a dialog/popup).
 pub fn is_root(id: u64) -> bool {
     unsafe { GetAncestor(hwnd(id), GA_ROOTOWNER) == hwnd(id) }
@@ -379,15 +384,18 @@ fn bring_on_screen(h: HWND) {
     let (rw, rh) = ((r.right - r.left).min(w), (r.bottom - r.top).min(ht));
     // workspace coordinates: (0,0) is the primary work area's top-left
     *r = RECT { left: 0, top: 0, right: rw, bottom: rh };
-    set_placement_async(h, &mut p);
+    set_placement_async(h, &mut p, false);
     log!("moved off-screen window {:x} to primary", h.0 as usize);
 }
 
 /// Applies a placement without activating the window (where Windows allows) and without
 /// waiting on its thread, keeping it minimized/maximized.
-fn set_placement_async(h: HWND, p: &mut WINDOWPLACEMENT) {
+fn set_placement_async(h: HWND, p: &mut WINDOWPLACEMENT, keep_hidden: bool) {
     unsafe {
-        p.showCmd = if IsIconic(h).as_bool() {
+        // SW_HIDE first: it updates the restored position and keeps the min/max state.
+        p.showCmd = if keep_hidden {
+            SW_HIDE.0 as u32
+        } else if IsIconic(h).as_bool() {
             SW_SHOWMINNOACTIVE.0 as u32
         } else if IsZoomed(h).as_bool() {
             SW_SHOWMAXIMIZED.0 as u32 // activates briefly; accepted (design risks)
@@ -401,7 +409,9 @@ fn set_placement_async(h: HWND, p: &mut WINDOWPLACEMENT) {
 
 /// Move windows from one monitor to another, keeping their position relative to the work area.
 /// Returns where the root window will appear (screen coordinates), for the soul to fly to.
-pub fn relocate(entries: &[Entry], from: &str, to: &str) -> Option<RECT> {
+/// Moves windows from monitor `from` to `to`, keeping their size and min/max state.
+/// `keep_hidden`: they're hidden and must stay so (moved into a hidden slot).
+pub fn relocate(entries: &[Entry], from: &str, to: &str, keep_hidden: bool) -> Option<RECT> {
     let mons = monitors();
     let work = |name: &str| mons.iter().find(|m| m.name == name).map(|m| m.work);
     let (Some(a), Some(b)) = (work(from), work(to)) else { return None };
@@ -419,14 +429,26 @@ pub fn relocate(entries: &[Entry], from: &str, to: &str) -> Option<RECT> {
         let left = (r.left + b.left - a.left).clamp(b.left - pwa.left, b.right - pwa.left - w);
         let top = (r.top + b.top - a.top).clamp(b.top - pwa.top, b.bottom - pwa.top - ht);
         p.rcNormalPosition = RECT { left, top, right: left + w, bottom: top + ht };
+        let zoomed = unsafe { IsZoomed(h).as_bool() };
         if is_root(e.id) {
-            root_rect = Some(if unsafe { IsZoomed(h).as_bool() } {
+            root_rect = Some(if zoomed {
                 b
             } else {
                 RECT { left: left + pwa.left, top: top + pwa.top, right: left + w + pwa.left, bottom: top + ht + pwa.top }
             });
         }
-        set_placement_async(h, &mut p);
+        set_placement_async(h, &mut p, keep_hidden);
+        if keep_hidden && zoomed {
+            // A hidden maximized window keeps its old maximized rect until shown: move it
+            // too, keeping its overhang past the work area (the resize borders).
+            if let Some(wr) = window_rect(e.id) {
+                let r = RECT { left: b.left + wr.left - a.left, top: b.top + wr.top - a.top, right: b.right + wr.right - a.right, bottom: b.bottom + wr.bottom - a.bottom };
+                unsafe {
+                    let _ = SetWindowPos(h, None, r.left, r.top, r.right - r.left, r.bottom - r.top,
+                        SWP_NOZORDER | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS);
+                }
+            }
+        }
     }
     root_rect
 }

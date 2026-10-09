@@ -18,6 +18,10 @@ use windows::core::w;
 const OPEN_MS: u64 = 250;
 const CLOSE_MS: u64 = 180;
 const CHOOSE_MS: u64 = 220;
+const LIFT_MS: u64 = 150;
+const LAND_MS: u64 = 220;
+/// A lifted preview fits this (like a dragged window's ghost), scaled for the monitor.
+const LIFT_MAX: (f32, f32) = (360.0, 240.0);
 /// Darkening without a frosted backdrop (it couldn't be captured), and with one.
 const DIM: f32 = 0.45;
 const TINT: f32 = 0.3;
@@ -101,6 +105,29 @@ struct Preview {
     home: Rect,
     cell: Rect,
     from_tile: bool,
+    /// Scale center in content pixels (the grab point once dragged; 0 before).
+    cx: f32,
+    cy: f32,
+    /// Dropped elsewhere: faded out, ignored from then on.
+    gone: bool,
+}
+
+impl Preview {
+    /// Offset and scale that put the content exactly on `r`, given the scale center.
+    fn place(&self, r: Rect) -> (f32, f32, f32, f32) {
+        let (sx, sy) = (r.w / self.sw, r.h / self.sh);
+        (r.x - self.cx + self.cx * sx, r.y - self.cy + self.cy * sy, sx, sy)
+    }
+}
+
+struct Drag {
+    idx: usize,
+    /// grab point in content pixels
+    c: (f32, f32),
+    s0: (f32, f32),
+    s1: (f32, f32),
+    last: POINT,
+    started: u64,
 }
 
 struct Set {
@@ -118,6 +145,8 @@ struct Set {
     entries: Vec<Entry>,
     /// When a closing set's motion is over and it can be removed.
     ends: u64,
+    /// A preview was dropped into another slot: the frozen backdrop is out of date.
+    dropped: bool,
 }
 
 #[derive(Default)]
@@ -129,11 +158,16 @@ pub struct State {
     open: Option<Set>,
     closing: Vec<Set>,
     hovered: Option<usize>,
+    drag: Option<Drag>,
+    /// Spans every monitor, above the panels, while a preview is dragged; its origin.
+    drag_layer: Option<(Overlay, POINT)>,
+    /// Dropped previews still flying on the drag layer, and when they're done.
+    flying: Vec<(IDCompositionVisual2, u64)>,
 }
 
 impl State {
     pub fn overlays(&self) -> impl Iterator<Item = &Overlay> {
-        self.overlays.iter()
+        self.overlays.iter().chain(self.drag_layer.as_ref().map(|(o, _)| o))
     }
 }
 
@@ -165,17 +199,22 @@ impl Tx {
     }
 
     fn rect(&self, p: &Preview, from: Rect, to: Rect) -> R<()> {
+        self.place(p, p.place(from), p.place(to))
+    }
+
+    /// Animates (offset x, offset y, scale x, scale y).
+    fn place(&self, p: &Preview, a: (f32, f32, f32, f32), b: (f32, f32, f32, f32)) -> R<()> {
         unsafe {
             if self.dur == 0 {
-                p.visual.SetOffsetX2(to.x)?;
-                p.visual.SetOffsetY2(to.y)?;
-                p.scale.SetScaleX2(to.w / p.sw)?;
-                return p.scale.SetScaleY2(to.h / p.sh);
+                p.visual.SetOffsetX2(b.0)?;
+                p.visual.SetOffsetY2(b.1)?;
+                p.scale.SetScaleX2(b.2)?;
+                return p.scale.SetScaleY2(b.3);
             }
-            p.visual.SetOffsetX(&self.anim(from.x, to.x)?)?;
-            p.visual.SetOffsetY(&self.anim(from.y, to.y)?)?;
-            p.scale.SetScaleX(&self.anim(from.w / p.sw, to.w / p.sw)?)?;
-            p.scale.SetScaleY(&self.anim(from.h / p.sh, to.h / p.sh)?)
+            p.visual.SetOffsetX(&self.anim(a.0, b.0)?)?;
+            p.visual.SetOffsetY(&self.anim(a.1, b.1)?)?;
+            p.scale.SetScaleX(&self.anim(a.2, b.2)?)?;
+            p.scale.SetScaleY(&self.anim(a.3, b.3)?)
         }
     }
 
@@ -354,7 +393,7 @@ fn open_in(g: &mut Gpu, monitor: &str, slot: usize, current: bool, roots: &[(Ent
                 (false, Some(t)) => (t.fit(cell.w, cell.h), true),
                 _ => (client(*r, mon), false),
             };
-            let p = Preview { id: e.id, visual, scale: st, fx, sw, sh, home, cell, from_tile };
+            let p = Preview { id: e.id, visual, scale: st, fx, sw, sh, home, cell, from_tile, cx: 0.0, cy: 0.0, gone: false };
             tx.rect(&p, home, cell)?;
             tx.opacity(&p.fx, if from_tile { 0.0 } else { 1.0 }, 1.0)?;
             previews.push(p);
@@ -368,7 +407,7 @@ fn open_in(g: &mut Gpu, monitor: &str, slot: usize, current: bool, roots: &[(Ent
         let _ = SetWindowPos(overlay.hwnd, Some(panel_hwnd), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
         g.expose.open = Some(Set {
             monitor: monitor.to_string(), slot, current, mon, root, dim, dim_to, backdrop, highlight: (hl_v, hl_scale, hl_fx), previews,
-            entries: roots.iter().map(|(e, _)| e.clone()).collect(), ends: 0,
+            entries: roots.iter().map(|(e, _)| e.clone()).collect(), ends: 0, dropped: false,
         });
         g.expose.hovered = None;
     }
@@ -387,11 +426,14 @@ fn collapse_in(g: &mut Gpu, motion: bool) -> R<()> {
     let tx = Tx::new(g, dur)?;
     unsafe {
         tx.opacity(&set.dim, set.dim_to, 0.0)?;
-        if let Some((blur, _)) = &set.backdrop {
-            if dur == 0 { blur.SetStandardDeviation2(0.0)? } else { blur.SetStandardDeviation(&tx.anim(BLUR, 0.0)?)? }
+        match &set.backdrop {
+            // the frozen picture still shows a window that was moved away: fade it
+            Some((_, fx)) if set.dropped => tx.opacity(fx, 1.0, 0.0)?,
+            Some((blur, _)) => if dur == 0 { blur.SetStandardDeviation2(0.0)? } else { blur.SetStandardDeviation(&tx.anim(BLUR, 0.0)?)? },
+            None => {}
         }
         set.highlight.2.SetOpacity2(0.0)?;
-        for p in &set.previews {
+        for p in set.previews.iter().filter(|p| !p.gone) {
             tx.rect(p, p.cell, p.home)?;
             if p.from_tile {
                 tx.opacity(&p.fx, 1.0, 0.0)?;
@@ -427,7 +469,7 @@ pub fn choose(i: usize, target: Option<RECT>, motion: bool) {
                 tx.opacity(fx, 1.0, 0.0)?;
             }
             set.highlight.2.SetOpacity2(0.0)?;
-            for (k, p) in set.previews.iter_mut().enumerate() {
+            for (k, p) in set.previews.iter_mut().enumerate().filter(|(_, p)| !p.gone) {
                 match target.filter(|_| k == i) {
                     Some(t) => {
                         // Land on the window at full resolution: no blurry moment at the end.
@@ -458,7 +500,8 @@ pub fn preview_at(pt: POINT) -> Option<usize> {
     gpu::with_existing(|g| {
         Ok(g.expose.open.as_ref().and_then(|s| {
             let (x, y) = ((pt.x - s.mon.left) as f32, (pt.y - s.mon.top) as f32);
-            s.previews.iter().rposition(|p| p.cell.contains(x, y))
+            let dragged = g.expose.drag.as_ref().map(|d| d.idx);
+            s.previews.iter().enumerate().rev().find(|(i, p)| !p.gone && Some(*i) != dragged && p.cell.contains(x, y)).map(|(i, _)| i)
         }))
     })
     .flatten()
@@ -553,13 +596,18 @@ pub fn reap(now: u64) -> bool {
         if !gone.is_empty() {
             remove(g, &gone)?;
         }
-        Ok(g.expose.open.is_some() || !g.expose.closing.is_empty())
+        let (landed, flying): (Vec<_>, Vec<_>) = std::mem::take(&mut g.expose.flying).into_iter().partition(|(_, ends)| now >= ends + 50);
+        g.expose.flying = flying;
+        if !landed.is_empty() {
+            drop_flying(g, &landed)?;
+        }
+        Ok(g.expose.open.is_some() || !g.expose.closing.is_empty() || !g.expose.flying.is_empty() || g.expose.drag.is_some())
     })
     .unwrap_or(false)
 }
 
 pub fn any() -> bool {
-    gpu::with_existing(|g| Ok(g.expose.open.is_some() || !g.expose.closing.is_empty())).unwrap_or(false)
+    gpu::with_existing(|g| Ok(g.expose.open.is_some() || !g.expose.closing.is_empty() || !g.expose.flying.is_empty())).unwrap_or(false)
 }
 
 /// Removes every spread at once (monitor change, Restore all, Exit, a switch).
@@ -568,6 +616,16 @@ pub fn clear_all() {
         let mut gone = std::mem::take(&mut g.expose.closing);
         gone.extend(g.expose.open.take());
         g.expose.hovered = None;
+        g.expose.drag = None;
+        let flying = std::mem::take(&mut g.expose.flying);
+        drop_flying(g, &flying)?;
+        if let Some((o, _)) = &g.expose.drag_layer {
+            unsafe {
+                // a dragged preview lives on the drag layer: take everything off it
+                let _ = o.root.RemoveAllVisuals();
+                let _ = ShowWindow(o.hwnd, SW_HIDE);
+            }
+        }
         remove(g, &gone)
     });
 }
@@ -588,6 +646,155 @@ fn remove(g: &Gpu, gone: &[Set]) -> R<()> {
         }
     }
     Ok(())
+}
+
+fn drop_flying(g: &Gpu, landed: &[(IDCompositionVisual2, u64)]) -> R<()> {
+    let Some((o, _)) = &g.expose.drag_layer else { return Ok(()) };
+    unsafe {
+        for (v, _) in landed {
+            let _ = o.root.RemoveVisual(v);
+        }
+        g.dcomp.Commit()?;
+        if g.expose.drag.is_none() && g.expose.flying.is_empty() {
+            let _ = ShowWindow(o.hwnd, SW_HIDE);
+        }
+    }
+    Ok(())
+}
+
+/// Previews in the open spread that haven't been dropped elsewhere.
+pub fn live() -> usize {
+    gpu::with_existing(|g| Ok(g.expose.open.as_ref().map_or(0, |s| s.previews.iter().filter(|p| !p.gone).count()))).unwrap_or(0)
+}
+
+/// The dragged preview: (monitor, slot, slot is current, window).
+pub fn drag_info() -> Option<(String, usize, bool, Entry)> {
+    let i = gpu::with_existing(|g| Ok(g.expose.drag.as_ref().map(|d| d.idx))).flatten()?;
+    chosen(i)
+}
+
+fn union_rect() -> RECT {
+    win::monitors().iter().fold(RECT { left: i32::MAX, top: i32::MAX, right: i32::MIN, bottom: i32::MIN }, |u, m| RECT {
+        left: u.left.min(m.rect.left),
+        top: u.top.min(m.rect.top),
+        right: u.right.max(m.rect.right),
+        bottom: u.bottom.max(m.rect.bottom),
+    })
+}
+
+/// Lifts preview `i` under the cursor: it moves onto the drag layer (above the panels, over
+/// every monitor), shrinks around the grab point, and follows `drag_move`.
+pub fn drag_start(i: usize, pt: POINT, motion: bool) -> bool {
+    let Some((monitor, _)) = open_slot() else { return false };
+    let scale = win::monitors().into_iter().find(|m| m.name == monitor).map_or(1.0, |m| m.scale);
+    let union = union_rect();
+    gpu::with_existing(|g| {
+        let Some(set) = g.expose.open.as_ref() else { return Ok(false) };
+        if set.previews.get(i).is_none_or(|p| p.gone) {
+            return Ok(false);
+        }
+        if g.expose.drag_layer.is_none() {
+            let o = gpu::make_overlay(&g.dcomp, "drag", union)?;
+            g.expose.drag_layer = Some((o, POINT { x: union.left, y: union.top }));
+        }
+        let tx = Tx::new(g, if motion { LIFT_MS } else { 0 })?;
+        let set = g.expose.open.as_mut().expect("checked");
+        let p = &mut set.previews[i];
+        let c = p.cell;
+        let (gx, gy) = ((pt.x - set.mon.left) as f32 - c.x, (pt.y - set.mon.top) as f32 - c.y);
+        let (cx, cy) = (gx / c.w * p.sw, gy / c.h * p.sh);
+        let s0 = (c.w / p.sw, c.h / p.sh);
+        let k = (LIFT_MAX.0 * scale / c.w).min(LIFT_MAX.1 * scale / c.h).min(1.0);
+        let s1 = (s0.0 * k, s0.1 * k);
+        let (layer, origin) = g.expose.drag_layer.as_ref().expect("made above");
+        unsafe {
+            set.root.RemoveVisual(&p.visual)?;
+            layer.root.AddVisual(&p.visual, false, None::<&IDCompositionVisual>)?;
+            // Center the scale on the grab point: then the grab point sits at offset + c
+            // whatever the scale, so the cursor can move it while the scale animates.
+            (p.cx, p.cy) = (cx, cy);
+            p.scale.SetCenterX2(cx)?;
+            p.scale.SetCenterY2(cy)?;
+            p.visual.SetOffsetX2((pt.x - origin.x) as f32 - cx)?;
+            p.visual.SetOffsetY2((pt.y - origin.y) as f32 - cy)?;
+            if tx.dur == 0 {
+                p.scale.SetScaleX2(s1.0)?;
+                p.scale.SetScaleY2(s1.1)?;
+            } else {
+                p.scale.SetScaleX(&tx.anim(s0.0, s1.0)?)?;
+                p.scale.SetScaleY(&tx.anim(s0.1, s1.1)?)?;
+            }
+            set.highlight.2.SetOpacity2(0.0)?;
+            g.dcomp.Commit()?;
+            let _ = SetWindowPos(layer.hwnd, Some(HWND_TOPMOST), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+        }
+        g.expose.hovered = None;
+        g.expose.drag = Some(Drag { idx: i, c: (cx, cy), s0, s1, last: pt, started: tx.begin_ms });
+        Ok(true)
+    })
+    .unwrap_or(false)
+}
+
+/// The lifted preview follows the cursor.
+pub fn drag_move(pt: POINT) {
+    gpu::with_existing(|g| {
+        let (Some(d), Some(set), Some((_, origin))) = (g.expose.drag.as_mut(), g.expose.open.as_ref(), g.expose.drag_layer.as_ref()) else { return Ok(()) };
+        d.last = pt;
+        let p = &set.previews[d.idx];
+        unsafe {
+            p.visual.SetOffsetX2((pt.x - origin.x) as f32 - d.c.0)?;
+            p.visual.SetOffsetY2((pt.y - origin.y) as f32 - d.c.1)?;
+            g.dcomp.Commit()
+        }
+    });
+}
+
+/// Where a dropped preview goes.
+pub enum Land {
+    /// Fly onto this screen rect (a tile, or the window's new place) and fade out.
+    Into(RECT),
+    /// Back to its place in the spread.
+    Back,
+}
+
+/// Ends a preview drag.
+pub fn drag_end(land: Land, motion: bool) {
+    gpu::with_existing(|g| {
+        let dur = if !motion { 0 } else if matches!(land, Land::Into(_)) { LAND_MS } else { CLOSE_MS };
+        let tx = Tx::new(g, dur)?;
+        let Some(d) = g.expose.drag.take() else { return Ok(()) };
+        let Some(set) = g.expose.open.as_mut() else { return Ok(()) };
+        let Some((layer, origin)) = g.expose.drag_layer.as_ref() else { return Ok(()) };
+        let p = &mut set.previews[d.idx];
+        // The lift may still be running: take its current scale from the same curve.
+        let now = win::now_ms();
+        let t = if motion { now.saturating_sub(d.started) as f32 / LIFT_MS as f32 } else { 1.0 };
+        let e = crate::anim::ease_out(t);
+        let s = (d.s0.0 + (d.s1.0 - d.s0.0) * e, d.s0.1 + (d.s1.1 - d.s0.1) * e);
+        unsafe {
+            match land {
+                Land::Into(r) => {
+                    let at = ((d.last.x - origin.x) as f32 - d.c.0, (d.last.y - origin.y) as f32 - d.c.1, s.0, s.1);
+                    let to = p.place(Rect { x: (r.left - origin.x) as f32, y: (r.top - origin.y) as f32, w: (r.right - r.left) as f32, h: (r.bottom - r.top) as f32 });
+                    tx.place(p, at, to)?;
+                    tx.opacity(&p.fx, 1.0, 0.0)?;
+                    p.gone = true;
+                    set.dropped = true;
+                    g.expose.flying.push((p.visual.clone(), tx.begin_ms + tx.dur));
+                }
+                Land::Back => {
+                    layer.root.RemoveVisual(&p.visual)?;
+                    set.root.AddVisual(&p.visual, false, None::<&IDCompositionVisual>)?; // in front
+                    let at = ((d.last.x - set.mon.left) as f32 - d.c.0, (d.last.y - set.mon.top) as f32 - d.c.1, s.0, s.1);
+                    tx.place(p, at, p.place(p.cell))?;
+                    if g.expose.flying.is_empty() {
+                        let _ = ShowWindow(layer.hwnd, SW_HIDE);
+                    }
+                }
+            }
+            g.dcomp.Commit()
+        }
+    });
 }
 
 #[cfg(test)]

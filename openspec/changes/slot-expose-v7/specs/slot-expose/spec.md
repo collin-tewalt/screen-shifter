@@ -49,6 +49,21 @@ Clicking a preview, or releasing `Ctrl+Alt` while the mouse is on one, SHALL swi
 - **WHEN** the spread is open and the mouse is not on a preview when the user releases `Ctrl+Alt`
 - **THEN** the spread collapses and nothing is switched or focused
 
+### Requirement: Previews can be dragged to another slot
+Pressing a preview and moving the mouse SHALL lift it (shrinking to about the size of a dragged window's ghost, around the grab point) and make it follow the mouse, with panel tiles highlighting as drop targets as for a window drag. Dropping it on a slot tile, or "+ New", of either monitor SHALL move that window (with its owned windows) into that slot exactly as dragging the real window onto that tile would, whether the window is currently visible or hidden in another slot; a hidden window moved to a monitor's current slot SHALL become visible there, and one moved into a hidden slot MUST NOT appear on screen in between. Dropping anywhere else, or releasing `Ctrl+Alt` while dragging, SHALL return the preview to its place with no change. A press and release without moving SHALL still choose the window.
+
+#### Scenario: Drag a hidden window to the other monitor
+- **WHEN** the spread shows monitor A's hidden slot 2 and the user drags the preview of "Notepad" onto monitor B's current tile
+- **THEN** Notepad appears on monitor B, is no longer in A's slot 2, and A's slots are unchanged otherwise
+
+#### Scenario: Drag into a new slot
+- **WHEN** the user drags a preview from monitor A's current slot onto A's "+ New" tile
+- **THEN** that window is hidden in a new last slot of A and the preview flies into the new tile
+
+#### Scenario: Cancel
+- **WHEN** the user drags a preview and drops it on the dimmed area
+- **THEN** the preview returns to its place and nothing moves
+
 ### Requirement: The spread animates
 When Windows animation effects are enabled, opening SHALL grow each preview out of its window's position on screen (current slot) or out of the hovered tile (hidden slot) while the monitor dims, collapsing SHALL fold them back, and choosing SHALL expand the chosen preview onto its window while the others fade. The motion SHALL be driven by the system compositor. With animation effects off, the spread SHALL appear and disappear without motion. Releasing `Ctrl+Alt` SHALL let the collapse or choose motion finish rather than cut it off. No preview or dimming may remain on screen more than 1 second after the spread is closed, or at all after monitors change, "Restore all windows", or Exit.
 

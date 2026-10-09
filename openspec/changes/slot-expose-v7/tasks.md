@@ -18,6 +18,13 @@
 - [ ] 3.3 `WM_CHORD_UP` with reason released chooses the highlighted preview, otherwise collapses (animated; panel hide doesn't remove the exposé); non-exposé switches remove it first; display change / Restore all / Exit clear
 - [ ] 3.4 `run_switch` options: no sheet, keep exposé, focus this window; `win::focus(entry)` restores minimized; choose target rect (frame, `GetWindowRect` fallback, `rcNormalPosition` when minimized, or fade); `choose()` (current-slot window no longer visible → collapse)
 
+## 3b. Drag previews (added after first use)
+
+- [ ] 3b.1 Press + 6 px move → preview drag (`hooks::DRAG`); re-parent onto the all-monitors drag overlay (above panels); grab-point scale center (center + offset in one commit); lift animation; offset follows the cursor; `panel::set_drop`; dragged preview excluded from hit tests, highlight hidden
+- [ ] 3b.2 `core::move_to_slot(.., in_slot)` with tests (hidden → own monitor's current = Visible; own slot = Rejected); drop: group = root + owned from the spread's source list; `do_move`; fly into tile + pulse / fly to relocated rect / spring back (re-parent into the set); dropped preview ignored; collapse when none left; drop the group from the visible list
+- [ ] 3b.3 Hidden windows in the move path: show when moved to a current slot; `relocate(.., keep_hidden)` → `SW_HIDE` placement first, + `SetWindowPos` with carried-over overhang for maximized
+- [ ] 3b.4 Cancel on non-tile drop, chord-up (cancel first, never choose), panel hide, display change / Restore all / Exit; `on_move` routes preview drags; drop hold for hover after a drop; backdrop fades on collapse after a drop
+
 ## 4. Verify
 
 - [ ] 4.1 `cargo test`, `cargo clippy --all-targets -- -D warnings` clean

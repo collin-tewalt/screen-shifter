@@ -9,7 +9,8 @@ The panel says *which* windows are in a slot but not what they look like, and th
 - **Snapshots:** hidden windows can't be drawn live, so when the panel appears, a background thread snapshots the visible windows on every monitor (`PrintWindow` full content, downscaled; hung and minimized windows skipped). A window without a snapshot shows a card with its icon and title.
 - **Animated:** previews grow out of their real window positions (current slot) or out of the hovered tile (hidden slot) while the monitor dims; collapse folds them back; choosing expands the chosen preview onto its window while the rest fade. All compositor-driven (DirectComposition, the v6 GPU layer). Hovering a preview highlights it.
 - Follows Windows' "Animation effects" (off: appear/disappear without motion). Requires the GPU path; where it's unavailable, hovering does nothing.
-- Non-goals: dragging previews between slots, live (continuously updating) previews, closing windows from the exposé, keyboard navigation.
+- **Drag a preview to a slot** (added after first use): press a preview and move it; it lifts to ghost size and follows the mouse; dropping it on a panel tile (either monitor, "+ New" included) moves that window there, exactly like dragging a real window onto a tile, even if the window is currently hidden in another slot. Dropping anywhere else springs it back.
+- Non-goals: live (continuously updating) previews, closing windows from the exposé, keyboard navigation.
 
 ## Capabilities
 

@@ -148,11 +148,14 @@ impl State {
     }
 
     /// Move a window (root + owned `entries`) from `from` monitor into `target` on `to`.
-    pub fn move_to_slot(&mut self, entries: &[Entry], from: &str, to: &str, target: Target, now_ms: u64) -> MoveResult {
+    /// `in_slot`: where it is now: None = on screen in `from`'s current slot; Some(i) =
+    /// hidden in `from`'s slot i (dragged from the exposé).
+    pub fn move_to_slot(&mut self, entries: &[Entry], from: &str, in_slot: Option<usize>, to: &str, target: Target, now_ms: u64) -> MoveResult {
         let Some(first) = entries.first() else { return MoveResult::Rejected };
+        let from_active = self.monitors.get(from).map_or(0, |m| m.active);
         let m = self.monitors.entry(to.to_string()).or_default();
         let to_active = m.active;
-        if from == to && target == Target::Slot(to_active) {
+        if from == to && target == Target::Slot(in_slot.unwrap_or(from_active)) {
             return MoveResult::Rejected; // dropped where it already is: change nothing
         }
         let Some(slot) = m.resolve(target) else { return MoveResult::Rejected };
@@ -596,7 +599,7 @@ mod tests {
         new(&mut s, A, vec![w(2)], LATER); // slots: [w1] [w2] [active, empty]
         prev(&mut s, A, vec![], 2 * LATER); // empty slot 3 pruned; on slot 2 showing w2
         // move w2 out to a new slot: slot 2 stays (active) but is now empty
-        assert_eq!(s.move_to_slot(&[w(2)], A, A, Target::New, 3 * LATER), MoveResult::Hidden(2));
+        assert_eq!(s.move_to_slot(&[w(2)], A, None, A, Target::New, 3 * LATER), MoveResult::Hidden(2));
         let p = next(&mut s, A, vec![], 4 * LATER);
         assert_eq!(ids(&p.show), [2]);
         assert_eq!((s.active(A), s.count(A)), (2, 2), "same number, different slot");
@@ -610,22 +613,46 @@ mod tests {
         }
         assert_eq!((s.active(A), s.count(A)), (MAX_SLOTS, MAX_SLOTS));
         assert_eq!(s.switch_to(A, Target::New, vec![w(99)], 99 * LATER), None);
-        assert_eq!(s.move_to_slot(&[w(99)], A, A, Target::New, 99 * LATER), MoveResult::Rejected);
+        assert_eq!(s.move_to_slot(&[w(99)], A, None, A, Target::New, 99 * LATER), MoveResult::Rejected);
         assert_eq!(s.count(A), MAX_SLOTS);
     }
 
     #[test]
     fn create_by_move_keeps_active() {
         let mut s = State::default();
-        assert_eq!(s.move_to_slot(&[w(1)], A, A, Target::New, 0), MoveResult::Hidden(1));
+        assert_eq!(s.move_to_slot(&[w(1)], A, None, A, Target::New, 0), MoveResult::Hidden(1));
         assert_eq!((s.active(A), s.count(A)), (1, 2));
         assert_eq!(s.slots(A).1[1], vec![w(1)]);
     }
 
     #[test]
+    fn hidden_window_moves_from_its_slot() {
+        let mut s = State::default();
+        new(&mut s, A, vec![w(1)], 0); // w(1) hidden in A's slot 1, A on slot 2
+        // dropped on its own slot: nothing
+        assert_eq!(s.move_to_slot(&[w(1)], A, Some(0), A, Target::Slot(0), LATER), MoveResult::Rejected);
+        // dropped on its own monitor's current slot: comes on screen there
+        assert_eq!(s.move_to_slot(&[w(1)], A, Some(0), A, Target::Slot(1), LATER), MoveResult::Visible);
+        assert!(s.hidden().is_empty());
+        assert_eq!(s.count(A), 1, "its emptied slot is removed");
+        // a quick switch on A captures it as on screen
+        let p = new(&mut s, A, vec![], LATER + 100);
+        assert_eq!(ids(&p.hide), [1]);
+    }
+
+    #[test]
+    fn hidden_window_to_other_monitors_hidden_slot() {
+        let mut s = State::default();
+        new(&mut s, A, vec![w(1)], 0);
+        assert_eq!(s.move_to_slot(&[w(1)], A, Some(0), B, Target::New, LATER), MoveResult::Hidden(1));
+        assert_eq!((s.count(A), s.count(B)), (1, 2));
+        assert_eq!(s.slots(B).1[1], vec![w(1)]);
+    }
+
+    #[test]
     fn stale_targets_are_rejected() {
         let mut s = State::default();
-        assert_eq!(s.move_to_slot(&[w(1)], A, B, Target::Slot(1), 0), MoveResult::Rejected);
+        assert_eq!(s.move_to_slot(&[w(1)], A, None, B, Target::Slot(1), 0), MoveResult::Rejected);
         assert_eq!(s.count(B), 1);
         assert!(s.hidden().is_empty());
     }
@@ -677,7 +704,7 @@ mod tests {
     #[test]
     fn move_same_monitor_active_slot_is_noop() {
         let mut s = State::default();
-        assert_eq!(s.move_to_slot(&[w(1)], A, A, Target::Slot(0), 0), MoveResult::Rejected);
+        assert_eq!(s.move_to_slot(&[w(1)], A, None, A, Target::Slot(0), 0), MoveResult::Rejected);
         assert!(s.hidden().is_empty());
         // and it leaves the race state alone: a quick switch still captures the window
         let p = new(&mut s, A, vec![w(1)], 10);
@@ -687,7 +714,7 @@ mod tests {
     #[test]
     fn move_same_monitor_other_slot() {
         let mut s = State::default();
-        assert_eq!(s.move_to_slot(&[w(1), w(2)], A, A, Target::New, 0), MoveResult::Hidden(1));
+        assert_eq!(s.move_to_slot(&[w(1), w(2)], A, None, A, Target::New, 0), MoveResult::Hidden(1));
         let p = s.switch_to(A, Target::Slot(1), vec![], LATER).unwrap();
         assert_eq!(ids(&p.show), [1, 2], "owned entries move with the root");
     }
@@ -696,7 +723,7 @@ mod tests {
     fn move_to_other_monitor_active_slot_records_nothing() {
         let mut s = State::default();
         new(&mut s, A, vec![w(1)], 0); // w(1) hidden in A slot 1
-        assert_eq!(s.move_to_slot(&[w(1)], A, B, Target::Slot(0), LATER), MoveResult::Visible);
+        assert_eq!(s.move_to_slot(&[w(1)], A, None, B, Target::Slot(0), LATER), MoveResult::Visible);
         assert!(s.hidden().is_empty());
         assert_eq!(s.count(A), 1, "A's slot emptied by the move is removed");
     }
@@ -704,7 +731,7 @@ mod tests {
     #[test]
     fn move_to_other_monitor_hidden_slot() {
         let mut s = State::default();
-        assert_eq!(s.move_to_slot(&[w(1)], A, B, Target::New, 0), MoveResult::Hidden(1));
+        assert_eq!(s.move_to_slot(&[w(1)], A, None, B, Target::New, 0), MoveResult::Hidden(1));
         let p = next(&mut s, B, vec![], LATER);
         assert_eq!(ids(&p.show), [1]);
     }
@@ -712,7 +739,7 @@ mod tests {
     #[test]
     fn quick_switch_after_move_keeps_new_slot() {
         let mut s = State::default();
-        s.move_to_slot(&[w(1)], A, A, Target::New, 100);
+        s.move_to_slot(&[w(1)], A, None, A, Target::New, 100);
         // hide hasn't landed: snapshot still lists w(1)
         let p = new(&mut s, A, vec![w(1), w(2)], 200);
         assert_eq!(ids(&p.hide), [2]);
@@ -722,7 +749,7 @@ mod tests {
     #[test]
     fn quick_switch_on_target_after_cross_monitor_move() {
         let mut s = State::default();
-        s.move_to_slot(&[w(1)], A, B, Target::Slot(0), 0); // relocation not landed
+        s.move_to_slot(&[w(1)], A, None, B, Target::Slot(0), 0); // relocation not landed
         let p = new(&mut s, B, vec![], 100);
         assert_eq!(ids(&p.hide), [1], "pending arrival must count as visible on B");
     }
@@ -733,7 +760,7 @@ mod tests {
         new(&mut s, B, vec![w(5)], 0);
         prev(&mut s, B, vec![], LATER); // B's last.show = [w(5)], soon stale
         // much later: user dragged w(5) to A by hand; then a move onto B's active slot
-        s.move_to_slot(&[w(1)], A, B, Target::Slot(0), 5 * LATER);
+        s.move_to_slot(&[w(1)], A, None, B, Target::Slot(0), 5 * LATER);
         let p = new(&mut s, B, vec![], 5 * LATER + 100);
         assert_eq!(ids(&p.hide), [1], "stale w(5) must not be resurrected");
     }
@@ -743,7 +770,7 @@ mod tests {
         let mut s = State::default();
         new(&mut s, A, vec![w(1)], 0);
         new(&mut s, A, vec![w(2)], LATER);
-        s.move_to_slot(&[w(3)], B, B, Target::New, 2 * LATER);
+        s.move_to_slot(&[w(3)], B, None, B, Target::New, 2 * LATER);
         s
     }
 
@@ -867,7 +894,7 @@ mod tests {
                     let to = mons[rand(2) as usize];
                     let t = target(&mut rand, &s, to);
                     if let Some(e) = screen[mon].first().cloned() {
-                        match s.move_to_slot(std::slice::from_ref(&e), mon, to, t, now) {
+                        match s.move_to_slot(std::slice::from_ref(&e), mon, None, to, t, now) {
                             MoveResult::Rejected => {}
                             MoveResult::Hidden(i) => {
                                 assert!(contains(&s.slots(to).1[i], e.id));

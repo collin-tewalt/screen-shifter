@@ -81,8 +81,14 @@ thread_local! {
     static APP: Cell<HWND> = Cell::new(HWND::default());
     /// The tile the mouse is resting on, waiting for HOVER_TIMER.
     static HOVER_TILE: RefCell<Option<(String, usize)>> = const { RefCell::new(None) };
-    /// Exposé preview under a left-down (chosen if the up lands on it too).
-    static PRESSED_PREVIEW: Cell<Option<usize>> = const { Cell::new(None) };
+    /// Exposé preview under a left-down, and where (chosen if the up lands on it too,
+    /// dragged if the mouse moves first).
+    static PRESSED_PREVIEW: Cell<Option<(usize, POINT)>> = const { Cell::new(None) };
+    /// A preview is being dragged (we set hooks::DRAG for it).
+    static PREVIEW_DRAG: Cell<bool> = const { Cell::new(false) };
+    /// The tile a preview was just dropped on: hovering it (or the other monitor) doesn't
+    /// swap or collapse the spread until the mouse is back on the spread's monitor.
+    static DROP_HOLD: RefCell<Option<(String, Target)>> = const { RefCell::new(None) };
     /// Each monitor's visible windows as of the panel opening (updated by switches and drops):
     /// the exposé of a current slot, without re-enumerating on every hover.
     static VISIBLE: RefCell<std::collections::HashMap<String, Vec<Entry>>> = RefCell::new(Default::default());
@@ -294,12 +300,17 @@ fn open_expose(monitor: String, i: usize) {
 /// Mouse moved with the panel up (not dragging): open, swap, highlight, or collapse.
 fn on_hover(pt: POINT) {
     let open = expose::open_slot();
+    let hold = DROP_HOLD.with(|h| h.borrow().clone());
+    if hold.is_some() && panel::hit(pt).flatten() == hold {
+        return; // still on the tile we just dropped on: the spread stays as it is
+    }
     match panel::hit(pt) {
         Some(Some((m, Target::Slot(i)))) => {
             if open.as_ref() == Some(&(m.clone(), i)) {
                 expose::set_hover(None);
             } else if open.is_some() {
                 stop_hover(); // already spreading: follow the mouse at once
+                DROP_HOLD.with(|h| h.borrow_mut().take());
                 open_expose(m, i);
             } else if HOVER_TILE.with(|t| t.borrow().as_ref() != Some(&(m.clone(), i))) {
                 HOVER_TILE.with(|t| *t.borrow_mut() = Some((m, i)));
@@ -313,11 +324,65 @@ fn on_hover(pt: POINT) {
     }
     if let Some((m, _)) = open {
         if win::monitor_at(pt).0 != m {
+            if hold.is_some() {
+                return; // coming back from a drop on the other monitor
+            }
             expose::collapse(motion_on());
             arm_anim_timer();
         } else {
+            DROP_HOLD.with(|h| h.borrow_mut().take()); // back on the spread's monitor
             expose::set_hover(expose::preview_at(pt));
         }
+    }
+}
+
+/// Ends a preview drag: the drop target decides where the window goes.
+fn drop_preview(pt: POINT) {
+    PREVIEW_DRAG.set(false);
+    hooks::DRAG.store(false, SeqCst);
+    panel::set_drop(None);
+    let motion = motion_on();
+    let (Some((monitor, slot, current, e)), Some(Some((to, target)))) = (expose::drag_info(), panel::hit(pt)) else {
+        expose::drag_end(expose::Land::Back, motion);
+        arm_anim_timer();
+        return;
+    };
+    // the window and its owned windows, from the list the spread was built from
+    let source = if current {
+        VISIBLE.with(|v| v.borrow().get(&monitor).cloned().unwrap_or_default())
+    } else {
+        STATE.with(|s| s.borrow().slots(&monitor).1.get(slot).cloned().unwrap_or_default())
+    };
+    let group: Vec<Entry> = source.into_iter().filter(|g| win::root_of(g.id) == e.id).collect();
+    let group = if group.is_empty() { vec![e.clone()] } else { group };
+    let land = match do_move(group, monitor, (!current).then_some(slot), to.clone(), target) {
+        Moved::Hidden(s) => {
+            panel::pulse(&to, s);
+            panel::tile_screen_rect(&to, s).map(|t| RECT { left: t.left + 20, top: t.top + 20, right: t.right - 20, bottom: t.bottom - 20 })
+        }
+        Moved::Relocated(r) => r.or_else(|| win::frame_rect(e.id)),
+        Moved::Nothing => None,
+    };
+    match land {
+        Some(r) => {
+            expose::drag_end(expose::Land::Into(r), motion);
+            DROP_HOLD.with(|h| *h.borrow_mut() = Some((to, target)));
+            if expose::live() == 0 {
+                expose::collapse(motion);
+            }
+        }
+        None => expose::drag_end(expose::Land::Back, motion),
+    }
+    arm_anim_timer();
+}
+
+/// A preview drag that can't finish normally (chord released, display change): back it goes.
+fn cancel_preview_drag() {
+    if PREVIEW_DRAG.replace(false) {
+        hooks::DRAG.store(false, SeqCst);
+        panel::set_drop(None);
+        expose::drag_end(expose::Land::Back, motion_on());
+        arm_anim_timer();
     }
 }
 
@@ -467,11 +532,12 @@ enum Moved {
 }
 
 /// Move a dragged window into a slot (design §7): write-ahead, relocate, hide, persist.
-fn do_move(entries: Vec<Entry>, from: String, to: String, target: Target) -> Moved {
+/// `in_slot`: None = it's on screen on `from`; Some(i) = hidden in `from`'s slot i.
+fn do_move(entries: Vec<Entry>, from: String, in_slot: Option<usize>, to: String, target: Target) -> Moved {
     let (result, extra) = STATE.with(|s| {
         let mut s = s.borrow_mut();
         let old = s.hidden();
-        let result = s.move_to_slot(&entries, &from, &to, target, win::now_ms());
+        let result = s.move_to_slot(&entries, &from, in_slot, &to, target, win::now_ms());
         (result, s.tag_active(&to, &core::leaving(&old, &s.hidden())))
     });
     if result == MoveResult::Rejected {
@@ -481,16 +547,28 @@ fn do_move(entries: Vec<Entry>, from: String, to: String, target: Target) -> Mov
     log!("move {} window(s) {from} -> {to} {result:?}", entries.len());
     let focused = win::has_focus(&entries);
     persist(&extra);
-    let new_rect = if from != to { win::relocate(&entries, &from, &to) } else { None };
+    // A hidden window moved into a hidden slot must not show while it's repositioned.
+    let keep_hidden = hide && in_slot.is_some();
+    let new_rect = if from != to { win::relocate(&entries, &from, &to, keep_hidden) } else { None };
     if hide {
         win::hide(&entries);
         snap::hidden(entries.iter().map(|e| e.id));
+    } else if in_slot.is_some() {
+        win::show(&entries); // a hidden window dropped on a current slot comes on screen
     }
     persist(&[]);
     if hide && focused {
         win::focus_after_switch(&[], &entries);
     }
     panel::update(panel_data());
+    if hide || from != to {
+        // the enumeration above can still see it before the async hide/move lands
+        VISIBLE.with(|v| {
+            if let Some(list) = v.borrow_mut().get_mut(&from) {
+                list.retain(|e| !entries.iter().any(|m| m.id == e.id));
+            }
+        });
+    }
     match result {
         MoveResult::Hidden(i) => Moved::Hidden(i),
         _ => Moved::Relocated(new_rect),
@@ -593,7 +671,7 @@ fn on_ldown(pt: POINT) {
     }
     // The exposé first: its overlay is click-through, so the window under it would start a drag.
     if let Some(i) = expose::preview_at(pt) {
-        PRESSED_PREVIEW.set(Some(i));
+        PRESSED_PREVIEW.set(Some((i, pt)));
         return;
     }
     if expose::dim_at(pt) {
@@ -617,6 +695,11 @@ fn on_ldown(pt: POINT) {
 }
 
 fn on_lup(pt: POINT) {
+    if PREVIEW_DRAG.get() {
+        PRESSED_PREVIEW.set(None);
+        drop_preview(pt);
+        return;
+    }
     if let Some((from, entries)) = DRAGGING.with(|d| d.borrow_mut().take()) {
         hooks::DRAG.store(false, SeqCst);
         panel::set_drop(None);
@@ -624,7 +707,7 @@ fn on_lup(pt: POINT) {
             soul_home(&entries);
             return;
         };
-        match do_move(entries.clone(), from, to.clone(), target) {
+        match do_move(entries.clone(), from, None, to.clone(), target) {
             Moved::Hidden(slot) if motion_on() => {
                 // after do_move's panel update, so a new tile is where the panel now draws it
                 match panel::tile_screen_rect(&to, slot) {
@@ -640,7 +723,7 @@ fn on_lup(pt: POINT) {
         }
         return;
     }
-    if let Some(i) = PRESSED_PREVIEW.take() {
+    if let Some((i, _)) = PRESSED_PREVIEW.take() {
         if expose::preview_at(pt) == Some(i) {
             choose(i);
         }
@@ -656,9 +739,23 @@ fn on_lup(pt: POINT) {
 fn on_move() {
     hooks::MOVE_PENDING.store(false, SeqCst);
     let pt = hooks::unpack(hooks::MOVE_PT.load(SeqCst));
-    if hooks::DRAG.load(SeqCst) {
+    if PREVIEW_DRAG.get() {
+        expose::drag_move(pt);
+        panel::set_drop(panel::hit(pt).flatten());
+    } else if hooks::DRAG.load(SeqCst) {
         panel::ghost_move(pt);
         panel::set_drop(panel::hit(pt).flatten());
+    } else if let Some((i, down)) = PRESSED_PREVIEW.get() {
+        // a press on a preview that moves more than a few pixels becomes a drag
+        let scale = win::monitors().into_iter().find(|m| m.name == win::monitor_at(down).0).map_or(1.0, |m| m.scale);
+        let far = ((pt.x - down.x).pow(2) + (pt.y - down.y).pow(2)) as f32 > (6.0 * scale).powi(2);
+        if far && expose::drag_start(i, down, motion_on()) {
+            PREVIEW_DRAG.set(true);
+            hooks::DRAG.store(true, SeqCst); // no switches mid-drag, as for window drags
+            stop_hover();
+            expose::drag_move(pt);
+            arm_anim_timer();
+        }
     } else if panel::is_shown() {
         on_hover(pt);
     }
@@ -667,6 +764,7 @@ fn on_move() {
 /// Shows every hidden window and resets to one slot per monitor, keeping the saved layout
 /// for the next start (Exit, logoff).
 fn show_all() {
+    cancel_preview_drag();
     anim::clear_all();
     let entries = STATE.with(|s| s.borrow_mut().restore_all());
     win::show(&entries);
@@ -769,9 +867,13 @@ unsafe extern "system" fn app_proc(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) ->
                 let _ = KillTimer(Some(h), PANEL_TIMER);
                 stop_hover();
                 hooks::HOVER.store(false, SeqCst);
+                DROP_HOLD.with(|d| d.borrow_mut().take());
+                // A release mid-drag cancels the drag; it never chooses.
+                let was_dragging = PREVIEW_DRAG.get();
+                cancel_preview_drag();
                 // Only a real release chooses (not Ctrl+Alt+Del, an AltGr key, or a reset).
                 match expose::hovered() {
-                    Some(i) if wp.0 == hooks::RELEASED => choose(i),
+                    Some(i) if wp.0 == hooks::RELEASED && !was_dragging => choose(i),
                     _ => {
                         expose::collapse(motion_on());
                         arm_anim_timer();
@@ -805,6 +907,7 @@ unsafe extern "system" fn app_proc(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) ->
             WM_SETTINGCHANGE => tray(h, NIM_MODIFY), // scaling may have changed
             WM_DISPLAYCHANGE => {
                 tray(h, NIM_MODIFY);
+                cancel_preview_drag();
                 anim::clear_all();
                 gpu::reset(); // overlays are sized to the old monitors
                 let reset = STATE.with(|s| s.borrow_mut().reset_if_monitors_changed(&win::monitor_names()));
