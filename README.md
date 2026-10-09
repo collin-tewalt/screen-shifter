@@ -14,6 +14,9 @@ Hold **`Ctrl+Alt`** to bring up a panel on every monitor showing what's in each 
 | Click **+ New** | Add an empty slot at the end and switch to it |
 | Press on a window and drag onto a tile | Move that window into that slot (either monitor) |
 | Drag a window onto **+ New** | Put it in a new slot at the end |
+| Rest on a tile | Exposé: that slot's windows spread across its monitor over a frosted backdrop |
+| Click a preview (or release `Ctrl+Alt` on it) | Switch to its slot and bring that window to the front |
+| Drag a preview onto a tile | Move that window into that slot, even if it's hidden right now |
 
 Release `Ctrl+Alt` (or drop somewhere that isn't a tile) to cancel a drag. The keyboard still works too:
 
@@ -68,4 +71,5 @@ Before running an older build (v0.3 or earlier), choose **Restore all**: older b
 - Hotkeys are fixed; if another app owns them, screen-shifter shows an error and exits.
 - While `Ctrl+Alt` is held, left clicks and the wheel go to screen-shifter, not to apps.
 - screen-shifter's overlays (panel, indicator, animations) don't appear in screenshots or screen sharing.
+- Exposé previews of hidden windows are pictures taken the last time they were on screen while the panel was open (kept in GPU memory only, never on disk); apps that can't draw themselves on request show an icon card or a black picture.
 - Protected video may show as black in the sliding picture; with HDR on, the picture can look slightly dimmer than the live screen.
