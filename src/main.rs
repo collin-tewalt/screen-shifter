@@ -10,6 +10,7 @@ mod gpu;
 mod snap;
 mod hooks;
 mod panel;
+mod touchpad;
 
 use crate::core::{Dir, Entry, MoveResult, Plan, Tagged, Target};
 use std::sync::atomic::Ordering::SeqCst;
@@ -40,6 +41,7 @@ const WM_TRAY: u32 = WM_APP + 1;
 const CMD_RESTORE: i32 = 1;
 const CMD_EXIT: i32 = 2;
 const CMD_STARTUP: i32 = 3;
+const CMD_TOUCHPAD: i32 = 4;
 /// Must match the manifest's `desktop:StartupTask TaskId`.
 const STARTUP_TASK: &str = "ScreenShifter";
 /// Tray icon sizes we ship (`tools/make_icons.py`).
@@ -83,7 +85,9 @@ thread_local! {
     static HOVER_TILE: RefCell<Option<(String, usize)>> = const { RefCell::new(None) };
     /// Exposé preview under a left-down, and where (chosen if the up lands on it too,
     /// dragged if the mouse moves first).
-    static PRESSED_PREVIEW: Cell<Option<(usize, POINT)>> = const { Cell::new(None) };
+    static PRESSED_PREVIEW: Cell<Option<(u64, POINT)>> = const { Cell::new(None) };
+    /// The screen when the current three-finger touch began.
+    static SWIPE_START: Cell<Option<touchpad::Phase>> = const { Cell::new(None) };
     /// A preview is being dragged (we set hooks::DRAG for it).
     static PREVIEW_DRAG: Cell<bool> = const { Cell::new(false) };
     /// The tile a preview was just dropped on: hovering it (or the other monitor) doesn't
@@ -116,6 +120,7 @@ fn main() {
         let default_hook = std::panic::take_hook();
         std::panic::set_hook(Box::new(move |info| {
             win::show_from_file();
+            touchpad::restore();
             default_hook(info);
         }));
 
@@ -130,6 +135,8 @@ fn main() {
         HOOKS.with(|h| *h.borrow_mut() = Some(hooks::start(app)));
         // Only now that nothing can fail: take back the saved layout.
         adopt_saved_layout();
+        touchpad::register(app);
+        touchpad::startup(); // asks once; applies Windows' three-finger setting if the owner said yes
         // If Windows closes us to update the package, it may relaunch us afterwards. Never
         // after a crash (a startup crash would loop) or a reboot (the startup task covers that).
         let _ = RegisterApplicationRestart(None, RESTART_NO_CRASH | RESTART_NO_HANG | RESTART_NO_REBOOT);
@@ -292,13 +299,25 @@ fn open_expose(monitor: String, i: usize) {
     };
     let roots: Vec<Entry> = entries.into_iter().filter(|e| win::is_root(e.id)).collect();
     let tile = panel::tile_screen_rect(&monitor, i);
+    if !hooks::PANEL_LATCH.load(SeqCst) {
+        expose::collapse(motion_on()); // the Ctrl+Alt exposé has one spread at a time
+    }
     if expose::open(&monitor, i, current, &roots, tile, motion_on()) {
         arm_anim_timer();
     }
 }
 
+/// Swipe up with the panel up: every monitor spreads its current slot at once.
+fn open_all_spreads() {
+    for m in win::monitor_names() {
+        let (active, _) = STATE.with(|s| s.borrow().slots(&m));
+        open_expose(m, active);
+    }
+}
+
 /// Mouse moved with the panel up (not dragging): open, swap, highlight, or collapse.
 fn on_hover(pt: POINT) {
+    let latched = hooks::PANEL_LATCH.load(SeqCst);
     let open = expose::open_slot();
     let hold = DROP_HOLD.with(|h| h.borrow().clone());
     if hold.is_some() && panel::hit(pt).flatten() == hold {
@@ -306,9 +325,11 @@ fn on_hover(pt: POINT) {
     }
     match panel::hit(pt) {
         Some(Some((m, Target::Slot(i)))) => {
-            if open.as_ref() == Some(&(m.clone(), i)) {
+            // In the swipe-opened exposé each monitor has its own spread, so only this one counts.
+            let here = expose::open_slot_on(&m);
+            if here == Some(i) {
                 expose::set_hover(None);
-            } else if open.is_some() {
+            } else if if latched { here.is_some() } else { open.is_some() } {
                 stop_hover(); // already spreading: follow the mouse at once
                 DROP_HOLD.with(|h| h.borrow_mut().take());
                 open_expose(m, i);
@@ -321,6 +342,12 @@ fn on_hover(pt: POINT) {
             return;
         }
         _ => stop_hover(),
+    }
+    if latched {
+        // Every monitor's spread stays up as the mouse moves between them.
+        DROP_HOLD.with(|h| h.borrow_mut().take());
+        expose::set_hover(expose::preview_at(pt));
+        return;
     }
     if let Some((m, _)) = open {
         if win::monitor_at(pt).0 != m {
@@ -387,15 +414,15 @@ fn cancel_preview_drag() {
 }
 
 /// The user picked exposé preview `i`: bring its slot and window forward.
-fn choose(i: usize) {
-    let Some((monitor, slot, current, e)) = expose::chosen(i) else { return };
+fn choose(id: u64) {
+    let Some((monitor, slot, current, e)) = expose::chosen(id) else { return };
     if current && !win::is_visible(e.id) {
         expose::collapse(motion_on()); // the list was stale: it's no longer on screen
         arm_anim_timer();
         return;
     }
     log!("expose: choose {:x} in {monitor} slot {}", e.id, slot + 1);
-    expose::choose(i, win::frame_rect(e.id), motion_on());
+    expose::choose(id, win::frame_rect(e.id), motion_on());
     arm_anim_timer();
     if current {
         win::focus(e.id);
@@ -409,6 +436,20 @@ fn choose(i: usize) {
 /// Hook-driven switches pick the monitor from the posted point, not a fresh cursor read.
 fn switch_at(pt: POINT, dir: Dir) {
     on_switch(win::monitor_at(pt).0, dir);
+}
+
+/// Releasing Ctrl+Alt over another slot's tile switches to it, as a click does.
+/// "+ New" and the monitor's current slot change nothing.
+fn release_on_tile() {
+    let mut pt = POINT::default();
+    unsafe {
+        let _ = GetCursorPos(&mut pt);
+    }
+    let Some(Some((monitor, Target::Slot(slot)))) = panel::hit(pt) else { return };
+    let current = STATE.with(|s| s.borrow().active(&monitor)) - 1;
+    if slot != current {
+        jump(monitor, Target::Slot(slot));
+    }
 }
 
 fn jump(monitor: String, target: Target) {
@@ -685,6 +726,11 @@ fn on_ldown(pt: POINT) {
         PRESSED.with(|p| *p.borrow_mut() = Some(hit));
         return;
     }
+    if hooks::PANEL_LATCH.load(SeqCst) {
+        // Empty space in swipe mode closes the panel; nothing under it may start a drag.
+        end_panel_mode();
+        return;
+    }
     let Some((monitor, entries)) = win::root_at(pt) else { return };
     let root = entries.iter().find(|e| win::is_root(e.id)).unwrap_or(&entries[0]).id;
     log!("drag start {:x} on {monitor}", root);
@@ -698,6 +744,7 @@ fn on_lup(pt: POINT) {
     if PREVIEW_DRAG.get() {
         PRESSED_PREVIEW.set(None);
         drop_preview(pt);
+        after_panel_click();
         return;
     }
     if let Some((from, entries)) = DRAGGING.with(|d| d.borrow_mut().take()) {
@@ -727,12 +774,92 @@ fn on_lup(pt: POINT) {
         if expose::preview_at(pt) == Some(i) {
             choose(i);
         }
+        after_panel_click();
         return;
     }
     if let Some(Some(pressed)) = PRESSED.with(|p| p.borrow_mut().take())
         && panel::hit(pt) == Some(Some(pressed.clone()))
     {
         jump(pressed.0, pressed.1);
+        after_panel_click();
+    }
+}
+
+/// Swipe mode ends with the click that acted: the panel closes, input goes back to normal.
+fn after_panel_click() {
+    if hooks::PANEL_LATCH.load(SeqCst) {
+        end_panel_mode();
+    }
+}
+
+/// Leaves swipe mode (Esc, three-finger swipe down, the Ctrl+Alt release, a click on empty
+/// space or after a pick). Closes the panel and switches nothing.
+fn end_panel_mode() {
+    hooks::PANEL_LATCH.store(false, SeqCst);
+    hooks::HOVER.store(false, SeqCst);
+    stop_hover();
+    PRESSED_PREVIEW.set(None);
+    PRESSED.with(|p| p.borrow_mut().take());
+    expose::collapse(motion_on());
+    arm_anim_timer();
+    panel::hide();
+}
+
+/// What the screen shows right now, for a three-finger swipe to move between.
+fn current_phase() -> touchpad::Phase {
+    if !panel::is_shown() {
+        touchpad::Phase::Closed
+    } else if expose::open_slot().is_some() {
+        touchpad::Phase::Expose
+    } else {
+        touchpad::Phase::Panel
+    }
+}
+
+/// Moves the screen to `target` one step at a time (at most two steps are ever needed).
+fn goto(target: touchpad::Phase) {
+    use touchpad::Phase::*;
+    for _ in 0..2 {
+        match (current_phase(), target) {
+            (cur, want) if cur == want => return,
+            (Closed, _) => {
+                hooks::PANEL_LATCH.store(true, SeqCst);
+                show_panels();
+            }
+            (Panel, Expose) => open_all_spreads(),
+            (Expose, Panel) => {
+                expose::collapse(motion_on());
+                arm_anim_timer();
+            }
+            (Panel | Expose, Closed) => {
+                // a preview under the fingers is chosen as the exposé closes
+                if let Some(id) = expose::hovered() {
+                    choose(id);
+                }
+                end_panel_mode();
+            }
+            (Panel, Panel) | (Expose, Expose) => return,
+        }
+    }
+}
+
+/// A three-finger touch, live. The panel and the exposé come in as the fingers pass each
+/// distance, and back out as they reverse; left and right switch the slot under the cursor
+/// once, as the swipe passes its threshold (negative left: next, as the slide animation runs).
+fn on_swipe(u: touchpad::Update) {
+    if !touchpad::enabled() || hooks::CHORD.load(SeqCst) {
+        return;
+    }
+    match u {
+        touchpad::Update::Begin => SWIPE_START.set(Some(current_phase())),
+        touchpad::Update::Vertical(dy) => {
+            if let Some(start) = SWIPE_START.get() {
+                goto(touchpad::target(start, dy));
+            }
+        }
+        touchpad::Update::Horizontal(dx) => {
+            on_switch(win::cursor_monitor().0, if dx < 0 { Dir::Next } else { Dir::Prev });
+        }
     }
 }
 
@@ -863,6 +990,19 @@ unsafe extern "system" fn app_proc(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) ->
                     show_panels();
                 }
             }
+            // A swipe-opened panel ends with the Ctrl+Alt release too: clicks decide, not keys.
+            hooks::WM_CHORD_UP if hooks::PANEL_LATCH.load(SeqCst) => end_panel_mode(),
+            hooks::WM_PANEL_ESC => {
+                if hooks::PANEL_LATCH.load(SeqCst) {
+                    end_panel_mode();
+                }
+            }
+            WM_INPUT => {
+                if let Some(u) = touchpad::on_raw_input(lp) {
+                    on_swipe(u);
+                }
+                return DefWindowProcW(h, msg, wp, lp);
+            }
             hooks::WM_CHORD_UP => {
                 let _ = KillTimer(Some(h), PANEL_TIMER);
                 stop_hover();
@@ -877,6 +1017,9 @@ unsafe extern "system" fn app_proc(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) ->
                     _ => {
                         expose::collapse(motion_on());
                         arm_anim_timer();
+                        if wp.0 == hooks::RELEASED && !was_dragging {
+                            release_on_tile();
+                        }
                     }
                 }
                 PRESSED_PREVIEW.set(None);
@@ -941,6 +1084,8 @@ fn shutdown(app: HWND) {
         }
         let _ = UnregisterHotKey(Some(app), HK_PREV);
         let _ = UnregisterHotKey(Some(app), HK_NEXT);
+        hooks::PANEL_LATCH.store(false, SeqCst);
+        touchpad::restore(); // Windows' three-finger setting goes back as it was
         tray(app, NIM_DELETE);
         let _ = DestroyWindow(app);
     }
@@ -987,6 +1132,8 @@ unsafe fn tray_menu(app: HWND) {
         let menu = CreatePopupMenu().unwrap();
         let _ = AppendMenuW(menu, MF_STRING, CMD_RESTORE as usize, w!("Restore all windows"));
         let _ = AppendMenuW(menu, MF_STRING | flags, CMD_STARTUP as usize, label);
+        let touchpad_flags = if touchpad::enabled() { MF_CHECKED } else { MF_UNCHECKED };
+        let _ = AppendMenuW(menu, MF_STRING | touchpad_flags, CMD_TOUCHPAD as usize, w!("Three-finger swipe opens panel"));
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
         let _ = AppendMenuW(menu, MF_STRING, CMD_EXIT as usize, w!("Exit"));
         let mut pt = Default::default();
@@ -1005,6 +1152,7 @@ unsafe fn tray_menu(app: HWND) {
                     toggle_startup(t);
                 }
             }
+            CMD_TOUCHPAD => touchpad::set_enabled(!touchpad::enabled()),
             CMD_EXIT => {
                 show_all(); // the next start takes them back
                 shutdown(app);

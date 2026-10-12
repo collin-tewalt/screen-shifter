@@ -20,6 +20,7 @@ pub const WM_HOOK_HWHEEL: u32 = WM_APP + 13;
 pub const WM_HOOK_LDOWN: u32 = WM_APP + 14;
 pub const WM_HOOK_LUP: u32 = WM_APP + 15;
 pub const WM_HOOK_MOVE: u32 = WM_APP + 16; // point in MOVE_PT; clear MOVE_PENDING when handled
+pub const WM_PANEL_ESC: u32 = WM_APP + 18; // Esc while a swipe-opened panel is up (the key still goes on)
 
 /// Ctrl+Alt held with no other key: mouse input is ours.
 pub static CHORD: AtomicBool = AtomicBool::new(false);
@@ -27,6 +28,9 @@ pub static CHORD: AtomicBool = AtomicBool::new(false);
 pub static DRAG: AtomicBool = AtomicBool::new(false);
 /// The panel is up: moves are posted while the chord is held (for the exposé).
 pub static HOVER: AtomicBool = AtomicBool::new(false);
+/// The panel was opened by a three-finger swipe: mouse input is ours until it closes, with no keys
+/// held. Swallowing checks treat it like CHORD; the chord-reset stays CHORD-only.
+pub static PANEL_LATCH: AtomicBool = AtomicBool::new(false);
 
 /// Why the chord ended. Only a real release may act (choose a preview).
 pub const RELEASED: usize = 0;
@@ -72,6 +76,9 @@ unsafe extern "system" fn keyboard(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT
         let k = unsafe { &*(lp.0 as *const KBDLLHOOKSTRUCT) };
         if k.flags & LLKHF_INJECTED != LLKHF_INJECTED {
             let down = matches!(wp.0 as u32, WM_KEYDOWN | WM_SYSKEYDOWN);
+            if down && k.vkCode == VK_ESCAPE.0 as u32 && PANEL_LATCH.load(SeqCst) {
+                post(WM_PANEL_ESC, 0, POINT::default());
+            }
             match VIRTUAL_KEY(k.vkCode as u16) {
                 VK_CONTROL | VK_LCONTROL | VK_RCONTROL => CTRL.store(down, SeqCst),
                 VK_MENU | VK_LMENU | VK_RMENU => ALT.store(down, SeqCst),
@@ -104,7 +111,7 @@ unsafe extern "system" fn mouse(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT {
             TAINT.store(false, SeqCst);
             update_chord(RESET);
         }
-        let chord = CHORD.load(SeqCst);
+        let chord = CHORD.load(SeqCst) || PANEL_LATCH.load(SeqCst);
         let delta = (m.mouseData >> 16) as u16 as i16 as isize as usize;
         let swallow = match wp.0 as u32 {
             WM_LBUTTONUP => SWALLOWED_DOWN.swap(false, SeqCst) && {

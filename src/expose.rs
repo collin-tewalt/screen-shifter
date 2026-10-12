@@ -121,7 +121,8 @@ impl Preview {
 }
 
 struct Drag {
-    idx: usize,
+    /// The dragged preview's window id.
+    id: u64,
     /// grab point in content pixels
     c: (f32, f32),
     s0: (f32, f32),
@@ -155,9 +156,11 @@ pub struct State {
     /// Pictures on the GPU, by window (grid size, full resolution); replaced by newer ones.
     surfaces: HashMap<u64, (Pic, Option<Pic>)>,
     cards: HashMap<u64, (IDCompositionSurface, f32, f32)>,
-    open: Option<Set>,
+    /// One spread per monitor (several at once in the swipe-opened exposé).
+    open: Vec<Set>,
     closing: Vec<Set>,
-    hovered: Option<usize>,
+    /// The window id of the highlighted preview, in whichever spread holds it.
+    hovered: Option<u64>,
     drag: Option<Drag>,
     /// Spans every monitor, above the panels, while a preview is dragged; its origin.
     drag_layer: Option<(Overlay, POINT)>,
@@ -300,20 +303,35 @@ fn content(g: &mut Gpu, id: u64, aspect: f32) -> R<Pic> {
 }
 
 /// Spreads `entries` (a slot's root windows, topmost first) across `monitor`. `tile`: the
-/// hovered tile's screen rect (hidden slots grow out of it). Any open spread collapses.
+/// hovered tile's screen rect (hidden slots grow out of it). The spread already open on this
+/// monitor, if any, collapses; spreads on other monitors are left alone.
 pub fn open(monitor: &str, slot: usize, current: bool, entries: &[Entry], tile: Option<RECT>, motion: bool) -> bool {
     let Some(m) = win::monitors().into_iter().find(|m| m.name == monitor) else { return false };
     let Some((panel_hwnd, panel_rect)) = crate::panel::window_of(monitor) else { return false };
     let roots: Vec<(Entry, RECT)> = entries.iter().filter_map(|e| Some((e.clone(), win::frame_rect(e.id)?))).collect();
     if roots.is_empty() {
-        collapse(motion);
+        collapse_monitor(monitor, motion);
         return false;
     }
     gpu::with(monitor, |g| {
-        collapse_in(g, motion)?;
+        collapse_monitor_in(g, monitor, motion)?;
         open_in(g, monitor, slot, current, &roots, tile, m.rect, m.work, panel_hwnd, panel_rect, m.scale, motion)
     })
     .is_some()
+}
+
+/// Collapses the spread on one monitor only.
+fn collapse_monitor(monitor: &str, motion: bool) {
+    gpu::with_existing(|g| collapse_monitor_in(g, monitor, motion));
+}
+
+fn collapse_monitor_in(g: &mut Gpu, monitor: &str, motion: bool) -> R<()> {
+    let (mine, rest): (Vec<Set>, Vec<Set>) = std::mem::take(&mut g.expose.open).into_iter().partition(|s| s.monitor == monitor);
+    g.expose.open = rest;
+    for set in mine {
+        fold(g, set, motion)?;
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -405,7 +423,7 @@ fn open_in(g: &mut Gpu, monitor: &str, slot: usize, current: bool, roots: &[(Ent
         g.dcomp.Commit()?;
         // Directly behind the panel: above every other window, never above the panel.
         let _ = SetWindowPos(overlay.hwnd, Some(panel_hwnd), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
-        g.expose.open = Some(Set {
+        g.expose.open.push(Set {
             monitor: monitor.to_string(), slot, current, mon, root, dim, dim_to, backdrop, highlight: (hl_v, hl_scale, hl_fx), previews,
             entries: roots.iter().map(|(e, _)| e.clone()).collect(), ends: 0, dropped: false,
         });
@@ -420,8 +438,15 @@ pub fn collapse(motion: bool) {
 }
 
 fn collapse_in(g: &mut Gpu, motion: bool) -> R<()> {
-    let Some(mut set) = g.expose.open.take() else { return Ok(()) };
     g.expose.hovered = None;
+    for set in std::mem::take(&mut g.expose.open) {
+        fold(g, set, motion)?;
+    }
+    Ok(())
+}
+
+/// Folds one spread back into its windows or tile, fading its dimming.
+fn fold(g: &mut Gpu, mut set: Set, motion: bool) -> R<()> {
     let dur = if motion { CLOSE_MS } else { 0 };
     let tx = Tx::new(g, dur)?;
     unsafe {
@@ -446,107 +471,119 @@ fn collapse_in(g: &mut Gpu, motion: bool) -> R<()> {
     Ok(())
 }
 
-/// What choosing preview `i` means: (monitor, slot, slot is current, window).
-pub fn chosen(i: usize) -> Option<(String, usize, bool, Entry)> {
+/// What choosing preview `id` means: (monitor, slot, slot is current, window).
+pub fn chosen(id: u64) -> Option<(String, usize, bool, Entry)> {
     gpu::with_existing(|g| {
         // previews and entries are in the same order
-        Ok(g.expose.open.as_ref().and_then(|s| Some((s.monitor.clone(), s.slot, s.current, s.entries.get(i)?.clone()))))
+        Ok(g.expose.open.iter().find_map(|s| {
+            let i = s.previews.iter().position(|p| p.id == id)?;
+            Some((s.monitor.clone(), s.slot, s.current, s.entries.get(i)?.clone()))
+        }))
     })
     .flatten()
 }
 
-/// The chosen preview flies onto its window (`target`, screen) or fades; the rest fade.
-pub fn choose(i: usize, target: Option<RECT>, motion: bool) {
+/// The chosen preview flies onto its window (`target`, screen) or fades. Every other spread
+/// on every monitor fades: a choice ends the exposé.
+pub fn choose(id: u64, target: Option<RECT>, motion: bool) {
     gpu::with_existing(|g| {
-        let Some(mut set) = g.expose.open.take() else { return Ok(()) };
+        let sets = std::mem::take(&mut g.expose.open);
         g.expose.hovered = None;
         let dur = if motion { CHOOSE_MS } else { 0 };
         let tx = Tx::new(g, dur)?;
-        unsafe {
-            tx.opacity(&set.dim, set.dim_to, 0.0)?;
-            // The slot underneath may change: fade the old picture rather than unblur it.
-            if let Some((_, fx)) = &set.backdrop {
-                tx.opacity(fx, 1.0, 0.0)?;
-            }
-            set.highlight.2.SetOpacity2(0.0)?;
-            for (k, p) in set.previews.iter_mut().enumerate().filter(|(_, p)| !p.gone) {
-                match target.filter(|_| k == i) {
-                    Some(t) => {
-                        // Land on the window at full resolution: no blurry moment at the end.
-                        if let Some(Some((full, fw, fh))) = g.expose.surfaces.get(&p.id).map(|(_, f)| f.clone()) {
-                            p.visual.SetContent(&full)?;
-                            (p.sw, p.sh) = (fw, fh);
+        for mut set in sets {
+            unsafe {
+                tx.opacity(&set.dim, set.dim_to, 0.0)?;
+                // The slot underneath may change: fade the old picture rather than unblur it.
+                if let Some((_, fx)) = &set.backdrop {
+                    tx.opacity(fx, 1.0, 0.0)?;
+                }
+                set.highlight.2.SetOpacity2(0.0)?;
+                for p in set.previews.iter_mut().filter(|p| !p.gone) {
+                    match target.filter(|_| p.id == id) {
+                        Some(t) => {
+                            // Land on the window at full resolution: no blurry moment at the end.
+                            if let Some(Some((full, fw, fh))) = g.expose.surfaces.get(&p.id).map(|(_, f)| f.clone()) {
+                                p.visual.SetContent(&full)?;
+                                (p.sw, p.sh) = (fw, fh);
+                            }
+                            tx.rect(p, p.cell, client(t, set.mon))?
                         }
-                        tx.rect(p, p.cell, client(t, set.mon))?
+                        None => tx.opacity(&p.fx, 1.0, 0.0)?,
                     }
-                    None => tx.opacity(&p.fx, 1.0, 0.0)?,
                 }
             }
-            g.dcomp.Commit()?;
+            set.ends = tx.begin_ms + dur;
+            g.expose.closing.push(set);
         }
-        set.ends = tx.begin_ms + dur;
-        g.expose.closing.push(set);
+        unsafe { g.dcomp.Commit()? };
         Ok(())
     });
 }
 
-/// The open spread's monitor and slot.
+/// The first open spread's monitor and slot (the only one in the Ctrl+Alt exposé).
 pub fn open_slot() -> Option<(String, usize)> {
-    gpu::with_existing(|g| Ok(g.expose.open.as_ref().map(|s| (s.monitor.clone(), s.slot)))).flatten()
+    gpu::with_existing(|g| Ok(g.expose.open.first().map(|s| (s.monitor.clone(), s.slot)))).flatten()
 }
 
-/// Index of the preview under a screen point.
-pub fn preview_at(pt: POINT) -> Option<usize> {
+/// The slot spread open on `monitor`, if any.
+pub fn open_slot_on(monitor: &str) -> Option<usize> {
+    gpu::with_existing(|g| Ok(g.expose.open.iter().find(|s| s.monitor == monitor).map(|s| s.slot))).flatten()
+}
+
+/// The window id of the preview under a screen point, in whichever spread is on that point.
+pub fn preview_at(pt: POINT) -> Option<u64> {
     gpu::with_existing(|g| {
-        Ok(g.expose.open.as_ref().and_then(|s| {
+        let dragged = g.expose.drag.as_ref().map(|d| d.id);
+        Ok(g.expose.open.iter().find(|s| inside(s.mon, pt)).and_then(|s| {
             let (x, y) = ((pt.x - s.mon.left) as f32, (pt.y - s.mon.top) as f32);
-            let dragged = g.expose.drag.as_ref().map(|d| d.idx);
-            s.previews.iter().enumerate().rev().find(|(i, p)| !p.gone && Some(*i) != dragged && p.cell.contains(x, y)).map(|(i, _)| i)
+            s.previews.iter().rev().find(|p| !p.gone && Some(p.id) != dragged && p.cell.contains(x, y)).map(|p| p.id)
         }))
     })
     .flatten()
 }
 
-/// On the open spread's monitor but not on a preview or the panel.
+fn inside(r: RECT, pt: POINT) -> bool {
+    pt.x >= r.left && pt.x < r.right && pt.y >= r.top && pt.y < r.bottom
+}
+
+/// On an open spread's monitor but not on a preview or that monitor's panel.
 pub fn dim_at(pt: POINT) -> bool {
-    let Some((monitor, _)) = open_slot() else { return false };
-    let on_mon = gpu::with_existing(|g| {
-        Ok(g.expose.open.as_ref().is_some_and(|s| {
-            pt.x >= s.mon.left && pt.x < s.mon.right && pt.y >= s.mon.top && pt.y < s.mon.bottom
-        }))
-    })
-    .unwrap_or(false);
-    let on_panel = crate::panel::window_of(&monitor).is_some_and(|(_, r)| pt.x >= r.left && pt.x < r.right && pt.y >= r.top && pt.y < r.bottom);
-    on_mon && !on_panel && preview_at(pt).is_none()
+    let Some(monitor) = gpu::with_existing(|g| Ok(g.expose.open.iter().find(|s| inside(s.mon, pt)).map(|s| s.monitor.clone()))).flatten() else {
+        return false;
+    };
+    let on_panel = crate::panel::window_of(&monitor).is_some_and(|(_, r)| inside(r, pt));
+    !on_panel && preview_at(pt).is_none()
 }
 
-pub fn hovered() -> Option<usize> {
-    gpu::with_existing(|g| Ok(g.expose.open.as_ref().and(g.expose.hovered))).flatten()
+pub fn hovered() -> Option<u64> {
+    gpu::with_existing(|g| Ok(g.expose.hovered.filter(|_| !g.expose.open.is_empty()))).flatten()
 }
 
-/// Highlights preview `i` (None: no highlight).
-pub fn set_hover(i: Option<usize>) {
+/// Highlights the preview with window id `id` in whichever spread holds it (None: none).
+pub fn set_hover(id: Option<u64>) {
     gpu::with_existing(|g| {
-        if g.expose.hovered == i {
+        if g.expose.hovered == id {
             return Ok(());
         }
-        let Some(set) = g.expose.open.as_ref() else { return Ok(()) };
-        let (v, st, fx) = &set.highlight;
         unsafe {
-            match i.and_then(|i| set.previews.get(i)) {
-                Some(p) => {
-                    let c = p.cell;
-                    v.SetOffsetX2(c.x - HIGHLIGHT)?;
-                    v.SetOffsetY2(c.y - HIGHLIGHT)?;
-                    st.SetScaleX2(c.w + 2.0 * HIGHLIGHT)?;
-                    st.SetScaleY2(c.h + 2.0 * HIGHLIGHT)?;
-                    fx.SetOpacity2(1.0)?;
+            for set in &g.expose.open {
+                let (v, st, fx) = &set.highlight;
+                match id.and_then(|id| set.previews.iter().find(|p| p.id == id && !p.gone)) {
+                    Some(p) => {
+                        let c = p.cell;
+                        v.SetOffsetX2(c.x - HIGHLIGHT)?;
+                        v.SetOffsetY2(c.y - HIGHLIGHT)?;
+                        st.SetScaleX2(c.w + 2.0 * HIGHLIGHT)?;
+                        st.SetScaleY2(c.h + 2.0 * HIGHLIGHT)?;
+                        fx.SetOpacity2(1.0)?;
+                    }
+                    None => fx.SetOpacity2(0.0)?,
                 }
-                None => fx.SetOpacity2(0.0)?,
             }
             g.dcomp.Commit()?;
         }
-        g.expose.hovered = i;
+        g.expose.hovered = id;
         Ok(())
     });
 }
@@ -569,14 +606,14 @@ pub fn snapshots_arrived(shots: Vec<crate::snap::Shot>) {
             let full = shot.full.as_ref().map(|p| upload(g, p)).transpose()?;
             g.expose.cards.remove(&id);
             g.expose.surfaces.insert(id, (s.clone(), full));
-            if let Some(set) = g.expose.open.as_mut()
-                && let Some(p) = set.previews.iter_mut().find(|p| p.id == id)
-            {
-                unsafe { p.visual.SetContent(&s.0)? };
-                (p.sw, p.sh) = (s.1, s.2);
-                let tx = Tx { dcomp: g.dcomp.clone(), begin: 0, begin_ms: 0, dur: 0 };
-                tx.rect(p, p.cell, p.cell)?;
-                changed = true;
+            for set in g.expose.open.iter_mut() {
+                if let Some(p) = set.previews.iter_mut().find(|p| p.id == id) {
+                    unsafe { p.visual.SetContent(&s.0)? };
+                    (p.sw, p.sh) = (s.1, s.2);
+                    let tx = Tx { dcomp: g.dcomp.clone(), begin: 0, begin_ms: 0, dur: 0 };
+                    tx.rect(p, p.cell, p.cell)?;
+                    changed = true;
+                }
             }
         }
         g.expose.surfaces.retain(|&id, _| unsafe { IsWindow(Some(win::hwnd(id))).as_bool() });
@@ -601,20 +638,20 @@ pub fn reap(now: u64) -> bool {
         if !landed.is_empty() {
             drop_flying(g, &landed)?;
         }
-        Ok(g.expose.open.is_some() || !g.expose.closing.is_empty() || !g.expose.flying.is_empty() || g.expose.drag.is_some())
+        Ok(!g.expose.open.is_empty() || !g.expose.closing.is_empty() || !g.expose.flying.is_empty() || g.expose.drag.is_some())
     })
     .unwrap_or(false)
 }
 
 pub fn any() -> bool {
-    gpu::with_existing(|g| Ok(g.expose.open.is_some() || !g.expose.closing.is_empty() || !g.expose.flying.is_empty())).unwrap_or(false)
+    gpu::with_existing(|g| Ok(!g.expose.open.is_empty() || !g.expose.closing.is_empty() || !g.expose.flying.is_empty())).unwrap_or(false)
 }
 
 /// Removes every spread at once (monitor change, Restore all, Exit, a switch).
 pub fn clear_all() {
     gpu::with_existing(|g| {
         let mut gone = std::mem::take(&mut g.expose.closing);
-        gone.extend(g.expose.open.take());
+        gone.extend(std::mem::take(&mut g.expose.open));
         g.expose.hovered = None;
         g.expose.drag = None;
         let flying = std::mem::take(&mut g.expose.flying);
@@ -662,15 +699,15 @@ fn drop_flying(g: &Gpu, landed: &[(IDCompositionVisual2, u64)]) -> R<()> {
     Ok(())
 }
 
-/// Previews in the open spread that haven't been dropped elsewhere.
+/// Previews in the open spreads that haven't been dropped elsewhere.
 pub fn live() -> usize {
-    gpu::with_existing(|g| Ok(g.expose.open.as_ref().map_or(0, |s| s.previews.iter().filter(|p| !p.gone).count()))).unwrap_or(0)
+    gpu::with_existing(|g| Ok(g.expose.open.iter().map(|s| s.previews.iter().filter(|p| !p.gone).count()).sum())).unwrap_or(0)
 }
 
 /// The dragged preview: (monitor, slot, slot is current, window).
 pub fn drag_info() -> Option<(String, usize, bool, Entry)> {
-    let i = gpu::with_existing(|g| Ok(g.expose.drag.as_ref().map(|d| d.idx))).flatten()?;
-    chosen(i)
+    let id = gpu::with_existing(|g| Ok(g.expose.drag.as_ref().map(|d| d.id))).flatten()?;
+    chosen(id)
 }
 
 fn union_rect() -> RECT {
@@ -682,23 +719,28 @@ fn union_rect() -> RECT {
     })
 }
 
-/// Lifts preview `i` under the cursor: it moves onto the drag layer (above the panels, over
+/// The open spread holding preview `id`, by position in `open`.
+fn holder(open: &[Set], id: u64) -> Option<usize> {
+    open.iter().position(|s| s.previews.iter().any(|p| p.id == id && !p.gone))
+}
+
+/// Lifts preview `id` under the cursor: it moves onto the drag layer (above the panels, over
 /// every monitor), shrinks around the grab point, and follows `drag_move`.
-pub fn drag_start(i: usize, pt: POINT, motion: bool) -> bool {
-    let Some((monitor, _)) = open_slot() else { return false };
+pub fn drag_start(id: u64, pt: POINT, motion: bool) -> bool {
+    let Some(monitor) = gpu::with_existing(|g| Ok(holder(&g.expose.open, id).map(|k| g.expose.open[k].monitor.clone()))).flatten() else {
+        return false;
+    };
     let scale = win::monitors().into_iter().find(|m| m.name == monitor).map_or(1.0, |m| m.scale);
     let union = union_rect();
     gpu::with_existing(|g| {
-        let Some(set) = g.expose.open.as_ref() else { return Ok(false) };
-        if set.previews.get(i).is_none_or(|p| p.gone) {
-            return Ok(false);
-        }
+        let Some(k) = holder(&g.expose.open, id) else { return Ok(false) };
         if g.expose.drag_layer.is_none() {
             let o = gpu::make_overlay(&g.dcomp, "drag", union)?;
             g.expose.drag_layer = Some((o, POINT { x: union.left, y: union.top }));
         }
         let tx = Tx::new(g, if motion { LIFT_MS } else { 0 })?;
-        let set = g.expose.open.as_mut().expect("checked");
+        let set = &mut g.expose.open[k];
+        let i = set.previews.iter().position(|p| p.id == id).expect("held above");
         let p = &mut set.previews[i];
         let c = p.cell;
         let (gx, gy) = ((pt.x - set.mon.left) as f32 - c.x, (pt.y - set.mon.top) as f32 - c.y);
@@ -729,7 +771,7 @@ pub fn drag_start(i: usize, pt: POINT, motion: bool) -> bool {
             let _ = SetWindowPos(layer.hwnd, Some(HWND_TOPMOST), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
         }
         g.expose.hovered = None;
-        g.expose.drag = Some(Drag { idx: i, c: (cx, cy), s0, s1, last: pt, started: tx.begin_ms });
+        g.expose.drag = Some(Drag { id, c: (cx, cy), s0, s1, last: pt, started: tx.begin_ms });
         Ok(true)
     })
     .unwrap_or(false)
@@ -738,9 +780,11 @@ pub fn drag_start(i: usize, pt: POINT, motion: bool) -> bool {
 /// The lifted preview follows the cursor.
 pub fn drag_move(pt: POINT) {
     gpu::with_existing(|g| {
-        let (Some(d), Some(set), Some((_, origin))) = (g.expose.drag.as_mut(), g.expose.open.as_ref(), g.expose.drag_layer.as_ref()) else { return Ok(()) };
+        let Some(id) = g.expose.drag.as_ref().map(|d| d.id) else { return Ok(()) };
+        let (Some(k), Some((_, origin))) = (holder(&g.expose.open, id), g.expose.drag_layer.as_ref()) else { return Ok(()) };
+        let d = g.expose.drag.as_mut().expect("checked");
         d.last = pt;
-        let p = &set.previews[d.idx];
+        let p = g.expose.open[k].previews.iter().find(|p| p.id == id).expect("held");
         unsafe {
             p.visual.SetOffsetX2((pt.x - origin.x) as f32 - d.c.0)?;
             p.visual.SetOffsetY2((pt.y - origin.y) as f32 - d.c.1)?;
@@ -763,9 +807,10 @@ pub fn drag_end(land: Land, motion: bool) {
         let dur = if !motion { 0 } else if matches!(land, Land::Into(_)) { LAND_MS } else { CLOSE_MS };
         let tx = Tx::new(g, dur)?;
         let Some(d) = g.expose.drag.take() else { return Ok(()) };
-        let Some(set) = g.expose.open.as_mut() else { return Ok(()) };
+        let Some(k) = holder(&g.expose.open, d.id) else { return Ok(()) };
         let Some((layer, origin)) = g.expose.drag_layer.as_ref() else { return Ok(()) };
-        let p = &mut set.previews[d.idx];
+        let set = &mut g.expose.open[k];
+        let p = set.previews.iter_mut().find(|p| p.id == d.id).expect("held");
         // The lift may still be running: take its current scale from the same curve.
         let now = win::now_ms();
         let t = if motion { now.saturating_sub(d.started) as f32 / LIFT_MS as f32 } else { 1.0 };

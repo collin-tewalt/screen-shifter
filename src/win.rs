@@ -548,7 +548,7 @@ pub fn packaged() -> bool {
 
 /// The package gets its own folder: Windows only redirects *new* AppData files into the
 /// package's private storage, so sharing a pre-existing dev folder would split the file.
-fn state_dir() -> PathBuf {
+pub fn state_dir() -> PathBuf {
     let base = std::env::var_os("LOCALAPPDATA").map_or_else(std::env::temp_dir, PathBuf::from);
     base.join(if packaged() { "screen-shifter-pkg" } else { "screen-shifter" })
 }
