@@ -63,6 +63,9 @@ const ANIM_TIMER: usize = 3;
 const ANIM_TIMER_MS: u32 = 250;
 /// Resting on a tile this long opens its exposé.
 const HOVER_TIMER: usize = 4;
+/// Longest a swipe-up exposé waits for the panel's pictures before it opens with placeholders.
+const EXPOSE_TIMER: usize = 5;
+const EXPOSE_WAIT_MS: u32 = 300;
 const HOVER_MS: u32 = 300;
 
 thread_local! {
@@ -88,6 +91,8 @@ thread_local! {
     static PRESSED_PREVIEW: Cell<Option<(u64, POINT)>> = const { Cell::new(None) };
     /// The screen when the current three-finger touch began.
     static SWIPE_START: Cell<Option<touchpad::Phase>> = const { Cell::new(None) };
+    /// A swipe-up exposé is waiting for the panel's pictures (see `open_all_spreads`).
+    static EXPOSE_WAIT: Cell<bool> = const { Cell::new(false) };
     /// A preview is being dragged (we set hooks::DRAG for it).
     static PREVIEW_DRAG: Cell<bool> = const { Cell::new(false) };
     /// The tile a preview was just dropped on: hovering it (or the other monitor) doesn't
@@ -307,11 +312,41 @@ fn open_expose(monitor: String, i: usize) {
     }
 }
 
-/// Swipe up with the panel up: every monitor spreads its current slot at once.
+/// Swipe up with the panel up: every monitor spreads its current slot at once. A fast swipe
+/// gets here before the panel's pictures are taken, and placeholders swapped in mid-animation
+/// look wrong, so this waits for the batch (up to EXPOSE_WAIT_MS) before spreading.
 fn open_all_spreads() {
+    if snap::busy() {
+        if !EXPOSE_WAIT.replace(true) {
+            unsafe {
+                SetTimer(Some(APP.get()), EXPOSE_TIMER, EXPOSE_WAIT_MS, None);
+            }
+        }
+        return;
+    }
+    spread_all_now();
+}
+
+fn spread_all_now() {
+    cancel_expose_wait();
     for m in win::monitor_names() {
         let (active, _) = STATE.with(|s| s.borrow().slots(&m));
         open_expose(m, active);
+    }
+}
+
+/// Spreads one monitor's current slot (the others stay as they are).
+fn spread_monitor(monitor: String) {
+    let (active, _) = STATE.with(|s| s.borrow().slots(&monitor));
+    open_expose(monitor, active);
+}
+
+/// Drops a pending swipe-up exposé (the swipe reversed, or the panel closed).
+fn cancel_expose_wait() {
+    if EXPOSE_WAIT.replace(false) {
+        unsafe {
+            let _ = KillTimer(Some(APP.get()), EXPOSE_TIMER);
+        }
     }
 }
 
@@ -492,10 +527,17 @@ fn switch_with(monitor: String, dir: Dir, chosen: Option<u64>, pick: impl FnOnce
     if hooks::DRAG.load(SeqCst) {
         return; // never hide the window under a drag
     }
+    // In swipe mode a switch keeps the exposé open on the switched monitor, spread for its new slot.
+    let swipe = chosen.is_none() && hooks::PANEL_LATCH.load(SeqCst);
+    let reopen = (swipe && expose::open_slot().is_some()).then(|| monitor.clone());
     if chosen.is_none() {
-        // never leave a spread sitting under a sheet
+        // never leave a spread sitting under a sheet: in swipe mode only this monitor's
         stop_hover();
-        expose::clear_all();
+        if swipe {
+            expose::collapse_monitor(&monitor, false);
+        } else {
+            expose::clear_all();
+        }
     }
     let visible = win::visible_windows_on(&monitor);
     let names = win::monitor_names();
@@ -510,6 +552,9 @@ fn switch_with(monitor: String, dir: Dir, chosen: Option<u64>, pick: impl FnOnce
         Some((plan, extra, s.active(&monitor), s.count(&monitor), others(&s) != before))
     });
     let Some((plan, extra, after, count, others_changed)) = result else {
+        if let Some(m) = reopen {
+            spread_monitor(m);
+        }
         return; // clamped, current slot, or stale
     };
     log!("{monitor}: {dir:?} to slot {after} / {count}, hide {}, show {}", plan.hide.len(), plan.show.len());
@@ -562,6 +607,9 @@ fn switch_with(monitor: String, dir: Dir, chosen: Option<u64>, pick: impl FnOnce
     }
     log!("  work: write-ahead {t_write:.1}, +hide/show {:.1}, +persist/focus {:.1}, +panel/osd {:.1} ms",
         t_hideshow - t_write, t_focus - t_hideshow, ms(t) - t_focus);
+    if let Some(m) = reopen {
+        spread_monitor(m);
+    }
 }
 
 enum Moved {
@@ -716,13 +764,21 @@ fn on_ldown(pt: POINT) {
         return;
     }
     if expose::dim_at(pt) {
-        expose::collapse(motion_on());
-        arm_anim_timer();
+        if hooks::PANEL_LATCH.load(SeqCst) {
+            end_panel_mode(); // empty space in swipe mode: the exposé and the panel close
+        } else {
+            expose::collapse(motion_on());
+            arm_anim_timer();
+        }
         return;
     }
     if panel::is_shown()
         && let Some(hit) = panel::hit(pt)
     {
+        if hit.is_none() && hooks::PANEL_LATCH.load(SeqCst) {
+            end_panel_mode(); // the gap between tiles is empty space: it closes a swipe-opened panel
+            return;
+        }
         PRESSED.with(|p| *p.borrow_mut() = Some(hit));
         return;
     }
@@ -795,6 +851,7 @@ fn after_panel_click() {
 /// Leaves swipe mode (Esc, three-finger swipe down, the Ctrl+Alt release, a click on empty
 /// space or after a pick). Closes the panel and switches nothing.
 fn end_panel_mode() {
+    cancel_expose_wait();
     hooks::PANEL_LATCH.store(false, SeqCst);
     hooks::HOVER.store(false, SeqCst);
     stop_hover();
@@ -819,6 +876,9 @@ fn current_phase() -> touchpad::Phase {
 /// Moves the screen to `target` one step at a time (at most two steps are ever needed).
 fn goto(target: touchpad::Phase) {
     use touchpad::Phase::*;
+    if target != Expose {
+        cancel_expose_wait();
+    }
     for _ in 0..2 {
         match (current_phase(), target) {
             (cur, want) if cur == want => return,
@@ -828,11 +888,18 @@ fn goto(target: touchpad::Phase) {
             }
             (Panel, Expose) => open_all_spreads(),
             (Expose, Panel) => {
+                // A preview under the mouse is chosen as the swipe leaves the exposé, as a
+                // Ctrl+Alt release over it does; this touch is then finished.
+                if let Some(id) = expose::hovered() {
+                    SWIPE_START.set(None);
+                    choose(id);
+                    end_panel_mode();
+                    return;
+                }
                 expose::collapse(motion_on());
                 arm_anim_timer();
             }
             (Panel | Expose, Closed) => {
-                // a preview under the fingers is chosen as the exposé closes
                 if let Some(id) = expose::hovered() {
                     choose(id);
                 }
@@ -983,7 +1050,18 @@ unsafe extern "system" fn app_proc(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) ->
                     open_expose(m, i);
                 }
             }
-            snap::WM_SNAPSHOT => expose::snapshots_arrived(snap::drain()),
+            snap::WM_SNAPSHOT => {
+                expose::snapshots_arrived(snap::drain());
+                if EXPOSE_WAIT.get() && !snap::busy() {
+                    spread_all_now();
+                }
+            }
+            WM_TIMER if wp.0 == EXPOSE_TIMER => {
+                let _ = KillTimer(Some(h), EXPOSE_TIMER);
+                if EXPOSE_WAIT.replace(false) {
+                    spread_all_now(); // the pictures are late: open with what there is
+                }
+            }
             WM_TIMER if wp.0 == PANEL_TIMER => {
                 let _ = KillTimer(Some(h), PANEL_TIMER);
                 if hooks::CHORD.load(SeqCst) {

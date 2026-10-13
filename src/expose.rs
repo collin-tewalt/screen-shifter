@@ -321,7 +321,7 @@ pub fn open(monitor: &str, slot: usize, current: bool, entries: &[Entry], tile: 
 }
 
 /// Collapses the spread on one monitor only.
-fn collapse_monitor(monitor: &str, motion: bool) {
+pub fn collapse_monitor(monitor: &str, motion: bool) {
     gpu::with_existing(|g| collapse_monitor_in(g, monitor, motion));
 }
 
@@ -445,8 +445,24 @@ fn collapse_in(g: &mut Gpu, motion: bool) -> R<()> {
     Ok(())
 }
 
+/// Puts the previews in their windows' stacking order (the topmost window's preview on top),
+/// so that folding or choosing moves them over one another as the real windows overlap.
+/// Previews are created topmost first, which `stack` would otherwise leave upside down.
+fn restack(set: &Set) -> R<()> {
+    unsafe {
+        let mut below = set.highlight.0.clone();
+        for p in set.previews.iter().rev().filter(|p| !p.gone) {
+            let _ = set.root.RemoveVisual(&p.visual);
+            set.root.AddVisual(&p.visual, true, &below)?;
+            below = p.visual.clone();
+        }
+    }
+    Ok(())
+}
+
 /// Folds one spread back into its windows or tile, fading its dimming.
 fn fold(g: &mut Gpu, mut set: Set, motion: bool) -> R<()> {
+    restack(&set)?;
     let dur = if motion { CLOSE_MS } else { 0 };
     let tx = Tx::new(g, dur)?;
     unsafe {
@@ -492,6 +508,7 @@ pub fn choose(id: u64, target: Option<RECT>, motion: bool) {
         let dur = if motion { CHOOSE_MS } else { 0 };
         let tx = Tx::new(g, dur)?;
         for mut set in sets {
+            restack(&set)?;
             unsafe {
                 tx.opacity(&set.dim, set.dim_to, 0.0)?;
                 // The slot underneath may change: fade the old picture rather than unblur it.

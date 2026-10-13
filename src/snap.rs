@@ -86,6 +86,10 @@ fn spawn(app: HWND) -> Worker {
             }
             crate::log!("snapshots: {n} in {:.0} ms", t.elapsed().as_secs_f64() * 1000.0);
             BUSY.store(false, SeqCst);
+            // The last picture's message may have been handled while still busy: say the batch ended.
+            unsafe {
+                let _ = PostMessageW(Some(HWND(app as *mut _)), WM_SNAPSHOT, WPARAM(0), LPARAM(0));
+            }
         }
     });
     (to_worker, from_worker)
@@ -95,6 +99,11 @@ fn spawn(app: HWND) -> Worker {
 pub fn hidden(ids: impl IntoIterator<Item = u64>) {
     let batch = BATCH.get();
     HIDDEN_AT.with(|h| h.borrow_mut().extend(ids.into_iter().map(|id| (id, batch))));
+}
+
+/// A batch is still capturing.
+pub fn busy() -> bool {
+    BUSY.load(SeqCst)
 }
 
 /// Pictures that arrived, minus any of a window hidden after its batch started.
