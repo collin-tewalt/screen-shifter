@@ -11,10 +11,11 @@ Hold **`Ctrl+Alt`** to bring up a panel on every monitor showing what's in each 
 | Wheel up / tilt right | Next slot on the monitor under the mouse |
 | Wheel down / tilt left | Previous slot on the monitor under the mouse |
 | Click a tile | Jump straight to that slot |
+| Click a tile's **×** | Close that slot: its windows fold into the slot to its left (to its right for the first); nothing is ever closed. A monitor's last slot has no ×. |
 | Click **+ New** | Add an empty slot at the end and switch to it |
 | Press on a window and drag onto a tile | Move that window into that slot (either monitor) |
 | Drag a window onto **+ New** | Put it in a new slot at the end |
-| Rest on a tile | Exposé: that slot's windows spread across its monitor over a frosted backdrop |
+| Rest on a tile | Exposé: that slot's windows spread across its monitor over a frosted backdrop, each preview with its app's icon at the bottom-left |
 | Click a preview (or release `Ctrl+Alt` on it) | Switch to its slot and bring that window to the front |
 | Drag a preview onto a tile | Move that window into that slot, even if it's hidden right now |
 

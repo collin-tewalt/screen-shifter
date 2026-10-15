@@ -47,4 +47,4 @@ Store builds are signed by Microsoft; any CI signing would use a certificate fro
 - `src/hooks.rs`: low-level keyboard/mouse hooks on their own thread (atomics + posted messages only).
 - `src/panel.rs`: the Ctrl+Alt panel and the window-drag ghost.
 - `src/anim.rs`: slide timing, GDI fallback sheets. `src/gpu.rs`: Desktop Duplication + DirectComposition (sheets, shared device).
-- `src/expose.rs`: the exposé (layout, transitions, preview drag). `src/snap.rs`: window snapshot worker.
+- `src/expose.rs`: the exposé (layout, transitions, preview drag). `src/snap.rs`: window snapshot worker. `src/icons.rs`: app icon worker (shell icons per app, cached).

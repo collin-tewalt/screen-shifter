@@ -8,6 +8,7 @@ mod anim;
 mod expose;
 mod gpu;
 mod snap;
+mod icons;
 mod hooks;
 mod panel;
 mod touchpad;
@@ -756,6 +757,22 @@ fn panel_data() -> Vec<panel::PanelData> {
         .collect()
 }
 
+/// Asks for the app icons of every root window the exposé can show, hidden ones too (an icon
+/// needs no visible window). The window's own icon goes along as the fallback source.
+fn request_icons() {
+    win::icon_budget(false);
+    let mut items = Vec::new();
+    for monitor in win::monitor_names() {
+        let (active, slots) = STATE.with(|s| s.borrow().slots(&monitor));
+        let on_screen = VISIBLE.with(|v| v.borrow().get(&monitor).cloned().unwrap_or_default());
+        for (i, slot) in slots.iter().enumerate() {
+            let entries = if i == active { &on_screen } else { slot };
+            items.extend(entries.iter().filter(|e| win::is_root(e.id)).map(|e| (e.id, win::icon_of(e.id).0 as isize)));
+        }
+    }
+    icons::request(APP.get(), items);
+}
+
 fn show_panels() {
     CLOSED_BY_X.set(None);
     win::icon_budget(true); // icons are looked up afresh each time the panel opens
@@ -766,6 +783,7 @@ fn show_panels() {
         v.borrow().values().flatten().filter(|e| !e.iconic && win::is_root(e.id)).map(|e| e.id).collect()
     });
     snap::start_batch(APP.get(), ids);
+    request_icons();
     let mut pt = POINT::default();
     unsafe {
         let _ = GetCursorPos(&mut pt);
@@ -1124,6 +1142,7 @@ unsafe extern "system" fn app_proc(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) ->
             }
             snap::WM_SNAPSHOT => {
                 expose::snapshots_arrived(snap::drain());
+                expose::icons_arrived(icons::drain());
                 if EXPOSE_WAIT.get() && !snap::busy() {
                     spread_all_now();
                 }

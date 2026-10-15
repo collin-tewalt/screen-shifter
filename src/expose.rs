@@ -28,6 +28,16 @@ const TINT: f32 = 0.3;
 /// Backdrop blur (standard deviation, px).
 const BLUR: f32 = 28.0;
 const GAP: f32 = 32.0;
+/// Preview icons: fade, inset from the preview's corner, share of its shorter side, size range
+/// (all in 100% pixels), and the smallest preview that carries one.
+const ICON_FADE_MS: u64 = 150;
+const ICON_OUT_MS: u64 = 90;
+const ICON_INSET: f32 = 8.0;
+const ICON_FRAC: f32 = 0.22;
+const ICON_RANGE: (f32, f32) = (32.0, 72.0);
+const ICON_MIN_CELL: f32 = 120.0;
+/// Icon pictures kept on the GPU (apps, not windows).
+const ICON_SURFACES: usize = 64;
 const MARGIN: f32 = 48.0;
 const HIGHLIGHT: f32 = 4.0;
 const ACCENT: u32 = 0xFF00_78D7; // BGRA of the panel accent
@@ -110,6 +120,21 @@ struct Preview {
     cy: f32,
     /// Dropped elsewhere: faded out, ignored from then on.
     gone: bool,
+    /// The app icon at its bottom-left, once known.
+    icon: Option<IDCompositionEffectGroup>,
+}
+
+/// Where a preview's icon goes (the preview is `cell`) and how big it is drawn: a share of the
+/// preview's shorter side within a range, never larger than the picture's own `max_px`.
+/// None when the preview is too small to carry one.
+fn icon_place(cell: Rect, scale: f32, max_px: f32) -> Option<Rect> {
+    let short = cell.w.min(cell.h);
+    if short < ICON_MIN_CELL * scale {
+        return None;
+    }
+    let size = (short * ICON_FRAC).clamp(ICON_RANGE.0 * scale, ICON_RANGE.1 * scale).min(max_px);
+    let inset = ICON_INSET * scale;
+    Some(Rect { x: cell.x + inset, y: cell.y + cell.h - inset - size, w: size, h: size })
 }
 
 impl Preview {
@@ -148,6 +173,12 @@ struct Set {
     ends: u64,
     /// A preview was dropped into another slot: the frozen backdrop is out of date.
     dropped: bool,
+    /// Holds every preview's icon, above all previews; its opacity fades them all at once.
+    icons: IDCompositionVisual2,
+    icons_fx: IDCompositionEffectGroup,
+    /// The monitor's scale, and when the open motion is over (0: no motion).
+    scale: f32,
+    settled: u64,
 }
 
 #[derive(Default)]
@@ -156,6 +187,9 @@ pub struct State {
     /// Pictures on the GPU, by window (grid size, full resolution); replaced by newer ones.
     surfaces: HashMap<u64, (Pic, Option<Pic>)>,
     cards: HashMap<u64, (IDCompositionSurface, f32, f32)>,
+    /// App icon pictures by app key, and each window's key.
+    icon_surfaces: HashMap<String, Pic>,
+    icon_keys: HashMap<u64, String>,
     /// One spread per monitor (several at once in the swipe-opened exposé).
     open: Vec<Set>,
     closing: Vec<Set>,
@@ -192,7 +226,12 @@ struct Tx {
 
 impl Tx {
     fn new(g: &Gpu, dur: u64) -> R<Tx> {
-        let (begin, begin_ms) = gpu::begin_time(&g.dcomp, 0)?;
+        Tx::after(g, dur, 0)
+    }
+
+    /// A transition starting `delay_ms` after the next frame.
+    fn after(g: &Gpu, dur: u64, delay_ms: u64) -> R<Tx> {
+        let (begin, begin_ms) = gpu::begin_time(&g.dcomp, delay_ms)?;
         Ok(Tx { dcomp: g.dcomp.clone(), begin, begin_ms, dur })
     }
 
@@ -236,6 +275,34 @@ fn stack(parent: &IDCompositionVisual2, child: &IDCompositionVisual2, top: &mut 
         }
     }
     *top = Some(child.clone());
+    Ok(())
+}
+
+/// Gives preview `i` of `set` its icon if the app's picture is known and the preview is big
+/// enough; it fades in with `tx`.
+fn add_icon(tx: &Tx, surfaces: &HashMap<String, Pic>, keys: &HashMap<u64, String>, set: &mut Set, i: usize) -> R<()> {
+    let p = &set.previews[i];
+    if p.icon.is_some() || p.gone {
+        return Ok(());
+    }
+    let Some((surface, w, h)) = keys.get(&p.id).and_then(|k| surfaces.get(k)) else { return Ok(()) };
+    let Some(r) = icon_place(p.cell, set.scale, w.max(*h)) else { return Ok(()) };
+    unsafe {
+        let visual = tx.dcomp.CreateVisual()?;
+        visual.SetContent(surface)?;
+        let st = tx.dcomp.CreateScaleTransform()?;
+        st.SetScaleX2(r.w / w)?;
+        st.SetScaleY2(r.h / h)?;
+        visual.SetTransform(&st)?;
+        visual.SetOffsetX2(r.x)?;
+        visual.SetOffsetY2(r.y)?;
+        let fx = tx.dcomp.CreateEffectGroup()?;
+        fx.SetOpacity2(0.0)?;
+        visual.SetEffect(&fx)?;
+        set.icons.AddVisual(&visual, false, None::<&IDCompositionVisual>)?;
+        tx.opacity(&fx, 0.0, 1.0)?;
+        set.previews[i].icon = Some(fx); // the container keeps the visual
+    }
     Ok(())
 }
 
@@ -411,11 +478,16 @@ fn open_in(g: &mut Gpu, monitor: &str, slot: usize, current: bool, roots: &[(Ent
                 (false, Some(t)) => (t.fit(cell.w, cell.h), true),
                 _ => (client(*r, mon), false),
             };
-            let p = Preview { id: e.id, visual, scale: st, fx, sw, sh, home, cell, from_tile, cx: 0.0, cy: 0.0, gone: false };
+            let p = Preview { id: e.id, visual, scale: st, fx, sw, sh, home, cell, from_tile, cx: 0.0, cy: 0.0, gone: false, icon: None };
             tx.rect(&p, home, cell)?;
             tx.opacity(&p.fx, if from_tile { 0.0 } else { 1.0 }, 1.0)?;
             previews.push(p);
         }
+        let icons = g.dcomp.CreateVisual()?;
+        let icons_fx = g.dcomp.CreateEffectGroup()?;
+        icons_fx.SetOpacity2(1.0)?;
+        icons.SetEffect(&icons_fx)?;
+        stack(&root, &icons, &mut top)?; // above every preview
         let overlay = g.expose.overlays.iter().find(|o| o.monitor == monitor).expect("made above");
         // In front of any spread still folding away on this monitor.
         let mut front = g.expose.closing.iter().rev().find(|s| s.monitor == monitor).map(|s| s.root.clone());
@@ -426,8 +498,16 @@ fn open_in(g: &mut Gpu, monitor: &str, slot: usize, current: bool, roots: &[(Ent
         g.expose.open.push(Set {
             monitor: monitor.to_string(), slot, current, mon, root, dim, dim_to, backdrop, highlight: (hl_v, hl_scale, hl_fx), previews,
             entries: roots.iter().map(|(e, _)| e.clone()).collect(), ends: 0, dropped: false,
+            icons, icons_fx, scale, settled: if motion { tx.begin_ms + OPEN_MS } else { 0 },
         });
         g.expose.hovered = None;
+        // Icons already known fade in once the spread has settled.
+        let k = g.expose.open.len() - 1;
+        let itx = Tx::after(g, if motion { ICON_FADE_MS } else { 0 }, if motion { OPEN_MS } else { 0 })?;
+        for i in 0..g.expose.open[k].previews.len() {
+            add_icon(&itx, &g.expose.icon_surfaces, &g.expose.icon_keys, &mut g.expose.open[k], i)?;
+        }
+        g.dcomp.Commit()?;
     }
     Ok(())
 }
@@ -474,6 +554,8 @@ fn fold(g: &mut Gpu, mut set: Set, motion: bool) -> R<()> {
             None => {}
         }
         set.highlight.2.SetOpacity2(0.0)?;
+        // icons go first, so they never trail their previews as these fold
+        Tx::new(g, if motion { ICON_OUT_MS } else { 0 })?.opacity(&set.icons_fx, 1.0, 0.0)?;
         for p in set.previews.iter().filter(|p| !p.gone) {
             tx.rect(p, p.cell, p.home)?;
             if p.from_tile {
@@ -507,6 +589,7 @@ pub fn choose(id: u64, target: Option<RECT>, motion: bool) {
         g.expose.hovered = None;
         let dur = if motion { CHOOSE_MS } else { 0 };
         let tx = Tx::new(g, dur)?;
+        let icons_out = Tx::new(g, if motion { ICON_OUT_MS } else { 0 })?;
         for mut set in sets {
             restack(&set)?;
             unsafe {
@@ -516,6 +599,7 @@ pub fn choose(id: u64, target: Option<RECT>, motion: bool) {
                     tx.opacity(fx, 1.0, 0.0)?;
                 }
                 set.highlight.2.SetOpacity2(0.0)?;
+                icons_out.opacity(&set.icons_fx, 1.0, 0.0)?;
                 for p in set.previews.iter_mut().filter(|p| !p.gone) {
                     match target.filter(|_| p.id == id) {
                         Some(t) => {
@@ -639,6 +723,39 @@ pub fn snapshots_arrived(shots: Vec<crate::snap::Shot>) {
             unsafe { g.dcomp.Commit()? };
         }
         Ok(())
+    });
+}
+
+/// New app icons arrived: upload each app's picture once (shrunk to what is ever drawn), and
+/// give previews in open spreads their icons (fading in, once the spread has settled).
+pub fn icons_arrived(icons: Vec<crate::icons::Icon>) {
+    if icons.is_empty() {
+        return;
+    }
+    let Some(any_monitor) = win::monitor_names().into_iter().next() else { return };
+    let side = (ICON_RANGE.1 * win::monitors().iter().map(|m| m.scale).fold(1.0, f32::max)).ceil() as i32;
+    gpu::with(&any_monitor, |g| {
+        for ic in icons {
+            if !g.expose.icon_surfaces.contains_key(&ic.key) {
+                if g.expose.icon_surfaces.len() >= ICON_SURFACES {
+                    g.expose.icon_surfaces.clear(); // open spreads keep their own references
+                }
+                let p = crate::icons::fit(&ic.pic, side);
+                let surface = gpu::surface_from_pixels(g, p.w, p.h, &p.pixels, true)?;
+                g.expose.icon_surfaces.insert(ic.key.clone(), (surface, p.w as f32, p.h as f32));
+            }
+            g.expose.icon_keys.insert(ic.id, ic.key);
+        }
+        g.expose.icon_keys.retain(|&id, _| unsafe { IsWindow(Some(win::hwnd(id))).as_bool() });
+        let now = win::now_ms();
+        for k in 0..g.expose.open.len() {
+            let settled = g.expose.open[k].settled;
+            let itx = Tx::after(g, if settled > 0 { ICON_FADE_MS } else { 0 }, settled.saturating_sub(now))?;
+            for i in 0..g.expose.open[k].previews.len() {
+                add_icon(&itx, &g.expose.icon_surfaces, &g.expose.icon_keys, &mut g.expose.open[k], i)?;
+            }
+        }
+        unsafe { g.dcomp.Commit() }
     });
 }
 
@@ -784,6 +901,9 @@ pub fn drag_start(id: u64, pt: POINT, motion: bool) -> bool {
                 p.scale.SetScaleY(&tx.anim(s0.1, s1.1)?)?;
             }
             set.highlight.2.SetOpacity2(0.0)?;
+            if let Some(fx) = &p.icon {
+                fx.SetOpacity2(0.0)?; // the icon stays behind while its preview is carried
+            }
             g.dcomp.Commit()?;
             let _ = SetWindowPos(layer.hwnd, Some(HWND_TOPMOST), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
         }
@@ -847,6 +967,12 @@ pub fn drag_end(land: Land, motion: bool) {
                 Land::Back => {
                     layer.root.RemoveVisual(&p.visual)?;
                     set.root.AddVisual(&p.visual, false, None::<&IDCompositionVisual>)?; // in front
+                    // ...which would cover the icons: they go back on top, and this one returns
+                    set.root.RemoveVisual(&set.icons)?;
+                    set.root.AddVisual(&set.icons, false, None::<&IDCompositionVisual>)?;
+                    if let Some(fx) = &p.icon {
+                        tx.opacity(fx, 0.0, 1.0)?;
+                    }
                     let at = ((d.last.x - set.mon.left) as f32 - d.c.0, (d.last.y - set.mon.top) as f32 - d.c.1, s.0, s.1);
                     tx.place(p, at, p.place(p.cell))?;
                     if g.expose.flying.is_empty() {
@@ -862,6 +988,32 @@ pub fn drag_end(land: Land, motion: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn icon_sits_in_the_bottom_left_and_is_sized_by_the_preview() {
+        let cell = Rect { x: 100.0, y: 50.0, w: 600.0, h: 400.0 };
+        let r = icon_place(cell, 1.0, 256.0).unwrap();
+        assert_eq!((r.w, r.h), (72.0, 72.0), "22% of 400 is 88: clamped to the top of the range");
+        assert_eq!((r.x, r.y + r.h), (108.0, 442.0), "inset 8 from the left and bottom edges");
+        let mid = icon_place(Rect { x: 0.0, y: 0.0, w: 300.0, h: 200.0 }, 1.0, 256.0).unwrap();
+        assert_eq!(mid.w, 44.0);
+        let small = icon_place(Rect { x: 0.0, y: 0.0, w: 300.0, h: 130.0 }, 1.0, 256.0).unwrap();
+        assert_eq!(small.w, 32.0, "bottom of the range");
+    }
+
+    #[test]
+    fn icon_scales_with_the_monitor_and_never_exceeds_its_pixels() {
+        let cell = Rect { x: 0.0, y: 0.0, w: 600.0, h: 400.0 };
+        assert_eq!(icon_place(cell, 2.0, 256.0).unwrap().w, 88.0, "22% of 400, within 64..144");
+        assert_eq!(icon_place(cell, 2.0, 64.0).unwrap().w, 64.0, "a 64 px picture is never drawn larger");
+    }
+
+    #[test]
+    fn tiny_previews_carry_no_icon() {
+        assert!(icon_place(Rect { x: 0.0, y: 0.0, w: 500.0, h: 119.0 }, 1.0, 256.0).is_none());
+        assert!(icon_place(Rect { x: 0.0, y: 0.0, w: 500.0, h: 239.0 }, 2.0, 256.0).is_none());
+        assert!(icon_place(Rect { x: 0.0, y: 0.0, w: 500.0, h: 120.0 }, 1.0, 256.0).is_some());
+    }
 
     const AREA: Rect = Rect { x: 48.0, y: 48.0, w: 2464.0, h: 1100.0 };
 
