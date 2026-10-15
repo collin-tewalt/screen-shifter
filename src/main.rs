@@ -79,6 +79,12 @@ thread_local! {
     static TILT: Cell<(u64, i32)> = const { Cell::new((0, 0)) };
     /// Panel hit at left-down (for click-to-jump): Some(None) = panel gap
     static PRESSED: RefCell<Option<Option<(String, Target)>>> = const { RefCell::new(None) };
+    /// The x pressed on a slot tile (acts if the release is on the same x).
+    static PRESSED_CLOSE: RefCell<Option<(String, usize)>> = const { RefCell::new(None) };
+    /// Where the cursor was when a slot was closed with the chord held: the panel shrinks
+    /// under it, so the release must not switch to whatever tile is there now (until the
+    /// mouse has moved away).
+    static CLOSED_BY_X: Cell<Option<POINT>> = const { Cell::new(None) };
     /// Window being dragged: its monitor and root + owned entries
     static DRAGGING: RefCell<Option<(String, Vec<Entry>)>> = const { RefCell::new(None) };
     /// A modal loop (tray menu) is running: our frame loop can't step animations.
@@ -352,6 +358,7 @@ fn cancel_expose_wait() {
 
 /// Mouse moved with the panel up (not dragging): open, swap, highlight, or collapse.
 fn on_hover(pt: POINT) {
+    panel::set_close_hover(pt);
     let latched = hooks::PANEL_LATCH.load(SeqCst);
     let open = expose::open_slot();
     let hold = DROP_HOLD.with(|h| h.borrow().clone());
@@ -404,7 +411,7 @@ fn drop_preview(pt: POINT) {
     hooks::DRAG.store(false, SeqCst);
     panel::set_drop(None);
     let motion = motion_on();
-    let (Some((monitor, slot, current, e)), Some(Some((to, target)))) = (expose::drag_info(), panel::hit(pt)) else {
+    let (Some((monitor, slot, current, e)), Some(Some((to, target)))) = (expose::drag_info(), panel::tile_hit(pt)) else {
         expose::drag_end(expose::Land::Back, motion);
         arm_anim_timer();
         return;
@@ -473,14 +480,59 @@ fn switch_at(pt: POINT, dir: Dir) {
     on_switch(win::monitor_at(pt).0, dir);
 }
 
-/// Releasing Ctrl+Alt over another slot's tile switches to it, as a click does.
-/// "+ New" and the monitor's current slot change nothing.
-fn release_on_tile() {
+/// The x on a slot tile: the slot folds into its neighbor on the left (the right for the first).
+/// Nothing is hidden, so no sheet and no refocus: windows that join the current slot just
+/// appear. Write-ahead as for a switch, since windows are about to be shown.
+fn close_slot_ui(monitor: String, i: usize) {
+    if hooks::DRAG.load(SeqCst) {
+        return;
+    }
+    stop_hover();
+    DROP_HOLD.with(|h| h.borrow_mut().take());
+    expose::collapse_monitor(&monitor, motion_on()); // its spread names slots that are about to renumber
+    arm_anim_timer();
+    let result = STATE.with(|s| {
+        let mut s = s.borrow_mut();
+        let old = s.hidden();
+        let closed = s.close_slot(&monitor, i, win::now_ms())?;
+        let extra = s.tag_active(&monitor, &core::leaving(&old, &s.hidden()));
+        Some((closed, extra))
+    });
+    let Some((closed, extra)) = result else { return };
+    log!("{monitor}: closed slot {}, showing {}", i + 1, closed.plan.show.len());
+    persist(&extra);
+    let shown = win::show(&closed.plan.show);
+    gpu::switched(&monitor);
+    let visible = VISIBLE.with(|v| {
+        let mut v = v.borrow_mut();
+        let list = v.entry(monitor.clone()).or_default();
+        list.extend(shown.iter().filter(|e| !list.iter().any(|x| x.id == e.id)).cloned().collect::<Vec<_>>());
+        list.clone()
+    });
+    persist(&[]);
+    // best effort: windows that were hidden when the panel opened have no picture yet
+    snap::start_batch(APP.get(), shown.iter().filter(|e| !e.iconic && win::is_root(e.id)).map(|e| e.id).collect());
+    panel::update(vec![panel_data_for(monitor.clone(), &visible)]);
+    panel::pulse(&monitor, closed.receiver);
+    arm_anim_timer();
     let mut pt = POINT::default();
     unsafe {
         let _ = GetCursorPos(&mut pt);
     }
-    let Some(Some((monitor, Target::Slot(slot)))) = panel::hit(pt) else { return };
+    CLOSED_BY_X.set(Some(pt));
+}
+
+/// Releasing Ctrl+Alt over another slot's tile switches to it, as a click does.
+/// "+ New" and the monitor's current slot change nothing.
+fn release_on_tile() {
+    if CLOSED_BY_X.take().is_some() {
+        return; // the panel moved under a still cursor after a close
+    }
+    let mut pt = POINT::default();
+    unsafe {
+        let _ = GetCursorPos(&mut pt);
+    }
+    let Some(Some((monitor, Target::Slot(slot)))) = panel::tile_hit(pt) else { return };
     let current = STATE.with(|s| s.borrow().active(&monitor)) - 1;
     if slot != current {
         jump(monitor, Target::Slot(slot));
@@ -705,6 +757,7 @@ fn panel_data() -> Vec<panel::PanelData> {
 }
 
 fn show_panels() {
+    CLOSED_BY_X.set(None);
     win::icon_budget(true); // icons are looked up afresh each time the panel opens
     panel::show(&win::monitors(), panel_data());
     hooks::HOVER.store(true, SeqCst);
@@ -773,7 +826,13 @@ fn on_ldown(pt: POINT) {
         return;
     }
     if panel::is_shown()
-        && let Some(hit) = panel::hit(pt)
+        && let Some(x) = panel::hit_close(pt)
+    {
+        PRESSED_CLOSE.with(|p| *p.borrow_mut() = Some(x));
+        return;
+    }
+    if panel::is_shown()
+        && let Some(hit) = panel::tile_hit(pt)
     {
         if hit.is_none() && hooks::PANEL_LATCH.load(SeqCst) {
             end_panel_mode(); // the gap between tiles is empty space: it closes a swipe-opened panel
@@ -806,7 +865,7 @@ fn on_lup(pt: POINT) {
     if let Some((from, entries)) = DRAGGING.with(|d| d.borrow_mut().take()) {
         hooks::DRAG.store(false, SeqCst);
         panel::set_drop(None);
-        let Some(Some((to, target))) = panel::hit(pt) else {
+        let Some(Some((to, target))) = panel::tile_hit(pt) else {
             soul_home(&entries);
             return;
         };
@@ -833,8 +892,14 @@ fn on_lup(pt: POINT) {
         after_panel_click();
         return;
     }
+    if let Some(x) = PRESSED_CLOSE.with(|p| p.borrow_mut().take()) {
+        if panel::hit_close(pt).as_ref() == Some(&x) {
+            close_slot_ui(x.0, x.1); // the panel stays up, in swipe mode too
+        }
+        return;
+    }
     if let Some(Some(pressed)) = PRESSED.with(|p| p.borrow_mut().take())
-        && panel::hit(pt) == Some(Some(pressed.clone()))
+        && panel::tile_hit(pt) == Some(Some(pressed.clone()))
     {
         jump(pressed.0, pressed.1);
         after_panel_click();
@@ -857,6 +922,8 @@ fn end_panel_mode() {
     stop_hover();
     PRESSED_PREVIEW.set(None);
     PRESSED.with(|p| p.borrow_mut().take());
+    PRESSED_CLOSE.with(|p| p.borrow_mut().take());
+    CLOSED_BY_X.set(None);
     expose::collapse(motion_on());
     arm_anim_timer();
     panel::hide();
@@ -933,12 +1000,17 @@ fn on_swipe(u: touchpad::Update) {
 fn on_move() {
     hooks::MOVE_PENDING.store(false, SeqCst);
     let pt = hooks::unpack(hooks::MOVE_PT.load(SeqCst));
+    if let Some(at) = CLOSED_BY_X.get()
+        && (pt.x - at.x).pow(2) + (pt.y - at.y).pow(2) > 64
+    {
+        CLOSED_BY_X.set(None); // the mouse went elsewhere: a release over a tile means it
+    }
     if PREVIEW_DRAG.get() {
         expose::drag_move(pt);
-        panel::set_drop(panel::hit(pt).flatten());
+        panel::set_drop(panel::tile_hit(pt).flatten());
     } else if hooks::DRAG.load(SeqCst) {
         panel::ghost_move(pt);
-        panel::set_drop(panel::hit(pt).flatten());
+        panel::set_drop(panel::tile_hit(pt).flatten());
     } else if let Some((i, down)) = PRESSED_PREVIEW.get() {
         // a press on a preview that moves more than a few pixels becomes a drag
         let scale = win::monitors().into_iter().find(|m| m.name == win::monitor_at(down).0).map_or(1.0, |m| m.scale);
@@ -1105,6 +1177,8 @@ unsafe extern "system" fn app_proc(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) ->
                 panel::hide();
                 WHEEL.set(0);
                 PRESSED.with(|p| p.borrow_mut().take());
+                PRESSED_CLOSE.with(|p| p.borrow_mut().take());
+                CLOSED_BY_X.set(None);
             }
             hooks::WM_HOOK_WHEEL => on_wheel(wp.0 as isize as i32, hooks::unpack(lp.0 as u64)),
             hooks::WM_HOOK_HWHEEL => on_tilt(wp.0 as isize as i32, hooks::unpack(lp.0 as u64)),
@@ -1129,6 +1203,7 @@ unsafe extern "system" fn app_proc(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) ->
             WM_DISPLAYCHANGE => {
                 tray(h, NIM_MODIFY);
                 cancel_preview_drag();
+                PRESSED_CLOSE.with(|p| p.borrow_mut().take());
                 anim::clear_all();
                 gpu::reset(); // overlays are sized to the old monitors
                 let reset = STATE.with(|s| s.borrow_mut().reset_if_monitors_changed(&win::monitor_names()));

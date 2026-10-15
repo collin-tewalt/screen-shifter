@@ -52,6 +52,8 @@ thread_local! {
     static FLIGHT: RefCell<Option<Flight>> = const { RefCell::new(None) };
     /// (monitor, slot, start) of a tile that just received a window
     static PULSE: RefCell<Option<(String, usize, u64)>> = const { RefCell::new(None) };
+    /// (monitor, slot) of the x under the cursor
+    static CLOSE_HOT: RefCell<Option<(String, usize)>> = const { RefCell::new(None) };
 }
 
 const FLY_MS: u64 = 180;
@@ -60,6 +62,8 @@ const GHOST_ALPHA: u8 = 150;
 
 const TILE: (i32, i32) = (220, 150);
 const GAP: i32 = 12;
+/// The close x: (diameter, margin from the tile's corner).
+const CLOSE: (i32, i32) = (22, 6);
 const MAX_TITLES: usize = 5;
 const GHOST_MAX: (i32, i32) = (360, 240);
 const BG: COLORREF = COLORREF(0x00202020);
@@ -83,6 +87,24 @@ fn tile_rect(i: usize, scale: f32) -> RECT {
 /// Slot tiles plus "+ New" below the limit.
 fn tiles(data: &PanelData) -> usize {
     data.titles.len() + (data.titles.len() < MAX_SLOTS) as usize
+}
+
+/// The x that closes slot tile `i`, in panel client coordinates (its top-right corner).
+fn close_rect(i: usize, scale: f32) -> RECT {
+    let (t, size, m) = (tile_rect(i, scale), px(CLOSE.0, scale), px(CLOSE.1, scale));
+    RECT { left: t.right - m - size, top: t.top + m, right: t.right - m, bottom: t.top + m + size }
+}
+
+/// Tiles carry an x only when there is another slot to fold into.
+fn has_close(data: &PanelData) -> bool {
+    data.titles.len() >= 2
+}
+
+/// The tile under a panel-local point, and whether the point is on its x.
+fn locate(data: &PanelData, scale: f32, local: POINT) -> Option<(usize, bool)> {
+    let i = (0..tiles(data)).find(|&i| unsafe { PtInRect(&tile_rect(i, scale), local).as_bool() })?;
+    let on_x = i < data.titles.len() && has_close(data) && unsafe { PtInRect(&close_rect(i, scale), local).as_bool() };
+    Some((i, on_x))
 }
 
 /// What tile `i` stands for.
@@ -167,6 +189,7 @@ pub fn hide() {
         }
     }
     DROP.with(|d| *d.borrow_mut() = None);
+    CLOSE_HOT.with(|c| *c.borrow_mut() = None);
 }
 
 pub fn is_shown() -> bool {
@@ -174,6 +197,7 @@ pub fn is_shown() -> bool {
 }
 
 pub fn update(mut data: Vec<PanelData>) {
+    CLOSE_HOT.with(|c| *c.borrow_mut() = None); // slot numbers may have changed under it
     PANELS.with(|p| {
         for panel in p.borrow_mut().iter_mut() {
             if let Some(i) = data.iter().position(|d| d.monitor == panel.data.monitor) {
@@ -194,14 +218,46 @@ pub fn update(mut data: Vec<PanelData>) {
 }
 
 /// None: not over a panel. Some(None): over a panel but between tiles. Some(Some(tile)).
+/// A tile's x counts as part of the tile (hovering it keeps the tile's spread).
 pub fn hit(pt: POINT) -> Option<Option<(String, Target)>> {
+    hit_in(pt, true)
+}
+
+/// Like `hit`, but a tile's x counts as between tiles: for what acts on a tile (a click, a
+/// release, a drop). An x is neither a click-through to its tile nor a drop target.
+pub fn tile_hit(pt: POINT) -> Option<Option<(String, Target)>> {
+    hit_in(pt, false)
+}
+
+fn hit_in(pt: POINT, with_x: bool) -> Option<Option<(String, Target)>> {
     PANELS.with(|p| {
         let p = p.borrow();
         let panel = p.iter().find(|p| unsafe { PtInRect(&p.rect, pt).as_bool() })?;
         let local = POINT { x: pt.x - panel.rect.left, y: pt.y - panel.rect.top };
-        let tile = (0..tiles(&panel.data)).find(|&i| unsafe { PtInRect(&tile_rect(i, panel.scale), local).as_bool() });
-        Some(tile.map(|i| (panel.data.monitor.clone(), target(&panel.data, i))))
+        let tile = locate(&panel.data, panel.scale, local).filter(|&(_, on_x)| with_x || !on_x);
+        Some(tile.map(|(i, _)| (panel.data.monitor.clone(), target(&panel.data, i))))
     })
+}
+
+/// The slot whose x is under `pt`: (monitor, slot).
+pub fn hit_close(pt: POINT) -> Option<(String, usize)> {
+    PANELS.with(|p| {
+        let p = p.borrow();
+        let panel = p.iter().find(|p| unsafe { PtInRect(&p.rect, pt).as_bool() })?;
+        let local = POINT { x: pt.x - panel.rect.left, y: pt.y - panel.rect.top };
+        match locate(&panel.data, panel.scale, local)? {
+            (i, true) => Some((panel.data.monitor.clone(), i)),
+            _ => None,
+        }
+    })
+}
+
+/// Highlights the x under `pt` (if any).
+pub fn set_close_hover(pt: POINT) {
+    let now = hit_close(pt);
+    if CLOSE_HOT.with(|c| c.replace(now.clone()) != now) {
+        invalidate_all();
+    }
 }
 
 /// Screen rect of a tile, for the soul to fly into.
@@ -418,6 +474,20 @@ unsafe fn paint(h: HWND) {
                 });
                 let base = if is_drop { DROP_BG } else { TILE_BG };
                 fill(dc, &inner, if pulse > 0.0 { mix(base, ACCENT, pulse) } else { base });
+                if has_close(&panel.data) {
+                    let c = close_rect(i, s);
+                    let hot = CLOSE_HOT.with(|h| h.borrow().as_ref().is_some_and(|(m, t)| *m == panel.data.monitor && *t == i));
+                    let (pen, brush) = (GetStockObject(NULL_PEN), CreateSolidBrush(if hot { mix(TILE_BG, TEXT, 0.3) } else { mix(TILE_BG, BG, 0.5) }));
+                    let (old_pen, old_brush) = (SelectObject(dc, pen), SelectObject(dc, brush.into()));
+                    let _ = Ellipse(dc, c.left, c.top, c.right, c.bottom);
+                    SelectObject(dc, old_pen);
+                    SelectObject(dc, old_brush);
+                    let _ = DeleteObject(brush.into());
+                    let old = SelectObject(dc, big.into());
+                    let mut cr = c;
+                    text(dc, "×", &mut cr, if hot { TEXT } else { DIM }, DT_CENTER | DT_VCENTER);
+                    SelectObject(dc, old);
+                }
                 let pad = px(10, s);
                 let line = px(20, s);
                 let old = SelectObject(dc, big.into());
@@ -552,5 +622,45 @@ pub fn ghost_end() {
     drop_snap();
     unsafe {
         let _ = ShowWindow(GHOST.get(), SW_HIDE);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn data(slots: usize) -> PanelData {
+        PanelData { monitor: "M".into(), active: 0, titles: vec![vec![]; slots] }
+    }
+    fn center(r: RECT) -> POINT {
+        POINT { x: (r.left + r.right) / 2, y: (r.top + r.bottom) / 2 }
+    }
+
+    #[test]
+    fn x_is_in_the_tiles_corner_when_there_are_two_slots() {
+        let d = data(3);
+        for i in 0..3 {
+            assert_eq!(locate(&d, 1.0, center(close_rect(i, 1.0))), Some((i, true)));
+            let t = tile_rect(i, 1.0);
+            assert_eq!(locate(&d, 1.0, POINT { x: t.left + 5, y: t.bottom - 5 }), Some((i, false)));
+        }
+    }
+
+    #[test]
+    fn no_x_on_a_single_slot_or_on_new() {
+        let one = data(1);
+        assert_eq!(locate(&one, 1.0, center(close_rect(0, 1.0))), Some((0, false)));
+        let two = data(2);
+        assert_eq!(tiles(&two), 3);
+        assert_eq!(locate(&two, 1.0, center(close_rect(2, 1.0))), Some((2, false)), "+ New");
+    }
+
+    #[test]
+    fn x_stays_inside_its_tile_and_scales() {
+        for s in [1.0_f32, 1.5, 2.5] {
+            let (t, c) = (tile_rect(1, s), close_rect(1, s));
+            assert!(c.left >= t.left && c.right <= t.right && c.top >= t.top && c.bottom <= t.bottom);
+            assert!(c.right - c.left >= 20);
+        }
     }
 }

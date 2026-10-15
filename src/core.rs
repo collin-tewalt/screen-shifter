@@ -42,6 +42,13 @@ pub enum MoveResult {
     Visible,
 }
 
+/// A closed slot: what to show, and the index (after removal) of the slot that took its windows.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Closed {
+    pub plan: Plan,
+    pub receiver: usize,
+}
+
 /// What the shell must do. Both lists are topmost-first.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Plan {
@@ -184,6 +191,39 @@ impl State {
         }
         let i = self.monitors[to].slots.iter().position(|s| contains(s, first.id)).expect("just recorded");
         MoveResult::Hidden(i)
+    }
+
+    /// Closes slot `i`, folding its windows into the one on its left (on its right for the first).
+    /// Nothing is ever hidden: the windows that become visible are in `plan.show`. None for an
+    /// unknown monitor, a single slot, or a stale index.
+    pub fn close_slot(&mut self, monitor: &str, i: usize, now_ms: u64) -> Option<Closed> {
+        let m = self.monitors.get_mut(monitor)?;
+        if m.slots.len() < 2 || i >= m.slots.len() {
+            return None;
+        }
+        let (active, n) = (m.active, if i == 0 { 1 } else { i - 1 });
+        let receiver = n - (n > i) as usize;
+        let removed = m.slots.remove(i);
+        let shown = if i == active {
+            m.active = receiver;
+            std::mem::take(&mut m.slots[receiver])
+        } else {
+            m.active -= (active > i) as usize;
+            if n == active {
+                removed
+            } else {
+                m.slots[receiver].extend(removed);
+                vec![]
+            }
+        };
+        if !shown.is_empty() {
+            // a quick switch must see them as on screen, even if an earlier plan hid them
+            let last = self.fresh_last(monitor, now_ms);
+            last.hide.retain(|e| !contains(&shown, e.id));
+            last.show.retain(|e| !contains(&shown, e.id));
+            last.show.extend(shown.iter().cloned());
+        }
+        Some(Closed { plan: Plan { show: shown, hide: vec![] }, receiver })
     }
 
     fn prune_all(&mut self) {
@@ -603,6 +643,119 @@ mod tests {
         let p = next(&mut s, A, vec![], 4 * LATER);
         assert_eq!(ids(&p.show), [2]);
         assert_eq!((s.active(A), s.count(A)), (2, 2), "same number, different slot");
+    }
+
+    #[test]
+    fn close_slot_folds_hidden_into_hidden_left_neighbor() {
+        let mut s = State::default();
+        new(&mut s, A, vec![w(1)], 0);
+        new(&mut s, A, vec![w(2)], LATER); // [w1] [w2] [active]
+        let c = s.close_slot(A, 1, 2 * LATER).unwrap();
+        assert_eq!((c.receiver, c.plan), (0, Plan::default()));
+        assert_eq!(ids(&s.slots(A).1[0]), [1, 2], "neighbor's windows first");
+        assert_eq!((s.active(A), s.count(A)), (2, 2));
+    }
+
+    #[test]
+    fn close_slot_right_of_active_neighbor_shows_its_windows() {
+        let mut s = State::default();
+        new(&mut s, A, vec![w(1)], 0);
+        new(&mut s, A, vec![w(2)], LATER);
+        prev(&mut s, A, vec![w(9)], 2 * LATER); // [w1] [active] [w9]
+        let c = s.close_slot(A, 2, 3 * LATER).unwrap();
+        assert_eq!((ids(&c.plan.show), c.receiver), (vec![9], 1));
+        assert_eq!((s.active(A), s.count(A)), (2, 2));
+        assert_eq!(ids(&s.hidden()), [1]);
+    }
+
+    #[test]
+    fn close_first_slot_folds_right() {
+        let mut s = State::default();
+        new(&mut s, A, vec![w(1)], 0); // [w1] [active]
+        let c = s.close_slot(A, 0, LATER).unwrap();
+        assert_eq!((ids(&c.plan.show), c.receiver), (vec![1], 0));
+        assert_eq!((s.active(A), s.count(A)), (1, 1));
+        assert!(s.hidden().is_empty());
+    }
+
+    #[test]
+    fn close_active_first_slot_shows_the_right_neighbor() {
+        let mut s = State::default();
+        new(&mut s, A, vec![w(1)], 0);
+        prev(&mut s, A, vec![w(5)], LATER); // [active] [w5]
+        let c = s.close_slot(A, 0, 2 * LATER).unwrap();
+        assert_eq!(ids(&c.plan.show), [5]);
+        assert_eq!((s.active(A), s.count(A)), (1, 1));
+        assert!(s.hidden().is_empty());
+    }
+
+    #[test]
+    fn close_active_slot_keeps_its_windows_and_shows_the_neighbors() {
+        let mut s = State::default();
+        new(&mut s, A, vec![w(1)], 0);
+        new(&mut s, A, vec![w(2)], LATER); // [w1] [w2] [active]
+        let c = s.close_slot(A, 2, 2 * LATER).unwrap();
+        assert_eq!((ids(&c.plan.show), c.receiver), (vec![2], 1));
+        assert!(c.plan.hide.is_empty());
+        assert_eq!((s.active(A), s.count(A)), (2, 2));
+        assert_eq!(ids(&s.hidden()), [1]);
+    }
+
+    #[test]
+    fn close_slot_rejects_single_stale_and_unknown() {
+        let mut s = State::default();
+        assert_eq!(s.close_slot(A, 0, 0), None, "unknown monitor");
+        new(&mut s, A, vec![w(1)], 0);
+        assert_eq!(s.close_slot(A, 5, LATER), None);
+        assert_eq!(s.close_slot(B, 0, LATER), None);
+        assert_eq!(s.monitors.len(), 1, "no monitor created");
+        s.close_slot(A, 0, LATER).unwrap();
+        assert_eq!(s.close_slot(A, 0, 2 * LATER), None, "the last slot stays");
+    }
+
+    #[test]
+    fn close_slot_invariants_hold_everywhere() {
+        for slots in 2..=5_usize {
+            for active in 0..slots {
+                for i in 0..slots {
+                    let mut s = State::default();
+                    for k in 1..slots as u64 {
+                        new(&mut s, A, vec![w(k)], k * LATER);
+                    }
+                    if active != slots - 1 {
+                        s.switch_to(A, Target::Slot(active), vec![w(100)], 50 * LATER).unwrap();
+                    }
+                    let hidden = s.hidden().len();
+                    let c = s.close_slot(A, i, 100 * LATER).unwrap();
+                    let (a, after) = s.slots(A);
+                    let at = format!("{slots} slots, active {active}, close {i}");
+                    assert_eq!(after.len(), slots - 1, "{at}");
+                    assert!(after[a].is_empty(), "active vec stays empty: {at}");
+                    assert!(after.iter().enumerate().all(|(k, v)| k == a || !v.is_empty()), "no empty inactive slot: {at}");
+                    assert!(c.receiver < after.len(), "{at}");
+                    assert_eq!(s.hidden().len() + c.plan.show.len(), hidden, "no window lost or duplicated: {at}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn close_without_a_shown_window_keeps_the_race_plan() {
+        let mut s = State::default();
+        new(&mut s, A, vec![w(1)], 0);
+        new(&mut s, A, vec![w(2)], LATER); // [w1] [w2] [active]; last hides w2
+        s.close_slot(A, 0, LATER + 10).unwrap(); // hidden into hidden: shows nothing
+        let p = prev(&mut s, A, vec![w(2), w(7)], LATER + 20); // a stale snapshot still lists w2
+        assert_eq!((ids(&p.hide), ids(&p.show)), (vec![7], vec![2, 1]));
+    }
+
+    #[test]
+    fn window_shown_by_a_close_is_seen_by_a_quick_switch() {
+        let mut s = State::default();
+        new(&mut s, A, vec![w(1)], 0); // [w1] [active]; last hides w1
+        s.close_slot(A, 0, 10).unwrap(); // w1 is shown again
+        let p = new(&mut s, A, vec![], 20); // enumeration doesn't list it yet
+        assert_eq!(ids(&p.hide), [1]);
     }
 
     #[test]
