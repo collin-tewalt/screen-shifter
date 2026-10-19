@@ -26,3 +26,14 @@ Closing slot `i` of a monitor with two or more slots SHALL remove it and move it
 #### Scenario: Restart after closing
 - **WHEN** a slot is closed and the app is closed or killed immediately afterwards
 - **THEN** on the next start every window the state file lists is shown or placed in a slot, none left hidden
+
+### Requirement: A closed window is forgotten from its slot
+When a window recorded in a hidden slot is closed from the exposé, the system SHALL remove it, and any of its recorded owned windows that no longer exist, from the slot and from the state file. A hidden slot that this empties SHALL be removed like any empty slot. Removing a window MUST NOT affect any other slot or monitor.
+
+#### Scenario: Last window closed
+- **WHEN** slot 3 holds one hidden window and it is closed from its preview
+- **THEN** slot 3 is removed and the slots after it renumber
+
+#### Scenario: Other windows remain
+- **WHEN** a hidden slot holds two windows and one is closed
+- **THEN** the slot holds the other and keeps its number

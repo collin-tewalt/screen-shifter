@@ -19,6 +19,14 @@
 - [x] 3.3 `src/expose.rs`: one shared GPU surface per key (box-filtered to the largest drawn size, map capped at 64 and cleared with the GPU reset; sets keep their own references); one icon container per set above all previews via `stack()`, each icon with its own opacity group at its cell's bottom-left (size per design §5, omitted under 120 px); `Tx::new` takes a delay via `begin_time(.., delay_ms)`; `Set` records the open time, fade-in starts at its end, late icons fade in at once; container fades out before the fold on collapse/choose; the dragged preview's icon is hidden and restored on `Land::Back`, which also re-raises the container above the re-added preview; removed with a `gone` preview; no fades with motion off
 - [x] 3.4 Pure parts (icon size/inset from a cell, omission threshold) as a tested function
 
+## 3b. An x on each preview (added after the first test)
+
+- [ ] 3b.1 `State::forget(monitor, slot, ids)` in `src/core.rs` (hidden slots only; also drops the ids from the race plan; prunes) with tests: last window removes the slot, other windows keep it, current slot and unknown monitor/stale index change nothing, no other slot touched
+- [ ] 3b.2 `close_badge(size, hot) -> Vec<u32>` pure, anti-aliased, premultiplied (disc + two strokes), tested (corners transparent, center covered, hot differs); `src/expose.rs` keeps the two surfaces per size
+- [ ] 3b.3 `src/expose.rs`: a badge visual per live preview in the icon container (fade with the icons, hidden while dragged and restored on `Land::Back`), at the cell's top-right; `close_at(pt)`, `set_close_hot(id)`, `dim_preview(id, on)` and `fade_out(id)` (marks `gone`)
+- [ ] 3b.4 `src/main.rs`: `PRESSED_CLOSE_WINDOW` in `on_ldown` (before `preview_at`), confirm in `on_lup`, cleared with `PRESSED_PREVIEW`; `on_hover` sets hover None and the badge hot while the cursor is on a badge; `request_close(id)` posts `WM_SYSCOMMAND/SC_CLOSE` to the root, dims the preview, pending list and a 250 ms `CLOSE_TIMER` polling gone/kept (3 s), then `forget`, `VISIBLE`, `persist(&[])`, `panel::update`, collapse when no live preview is left; the timer stops when nothing is pending; pending cleared on exit paths (`end_panel_mode`, chord up, display change)
+- [ ] 3b.5 README row for the preview x
+
 ## 4. Verify and finish
 
 - [x] 4.1 `cargo test` and `cargo clippy --all-targets -- -D warnings` clean
