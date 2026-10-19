@@ -20,7 +20,7 @@ Each preview large enough to carry one SHALL show its application's icon at the 
 - **THEN** the window's own icon is shown at its native size, or none if there isn't one
 
 ### Requirement: Previews carry an x that asks the app to close the window
-Each preview SHALL show an x at its top-right, highlighted while the cursor is on it. Clicking it (press and release on the same x) SHALL send the window a normal close request, as its own close button does, and SHALL NOT force-kill anything. The preview SHALL dim while the request is pending. When the window is gone (destroyed, or for a window of the current slot no longer shown) its preview SHALL fade away, the window SHALL be removed from its slot (a hidden slot that empties is removed and its spread collapses), and the panel SHALL update. If the window is still there after about three seconds, the preview SHALL return to normal and nothing else changes. Pressing an x SHALL NOT start a drag, releasing `Ctrl+Alt` over an x SHALL NOT choose the window, and the slot tile's x in the panel SHALL NOT close any window.
+Each preview SHALL show an x at its top-right, highlighted while the cursor is on it. Clicking it (press and release on the same x) SHALL send the window a normal close request, as its own close button does, and SHALL NOT force-kill anything. The preview SHALL dim while the request is pending. When the window is gone (destroyed) its preview SHALL fade away, the window SHALL be removed from its slot (a hidden slot that empties is removed and its spread collapses), and the panel SHALL update. If the window is still there after about three seconds, the preview SHALL return to normal and nothing else changes; the system keeps watching, so a window that closes later is still removed. A preview dimmed or gone SHALL NOT stay highlighted or be chosen by a release. The x does not end the swipe-opened exposé. Pressing an x SHALL NOT start a drag, releasing `Ctrl+Alt` over an x SHALL NOT choose the window, and the slot tile's x in the panel SHALL NOT close any window.
 
 #### Scenario: Close a window in a hidden slot
 - **WHEN** the spread of a hidden slot with two windows is up and the user clicks the x on one preview
@@ -34,9 +34,13 @@ Each preview SHALL show an x at its top-right, highlighted while the cursor is o
 - **WHEN** the only window of a hidden slot is closed from its preview
 - **THEN** the slot is removed, the spread collapses, and the panel shows one slot fewer
 
-#### Scenario: Closing to the tray
-- **WHEN** the window of an app that hides to the tray instead of closing is a preview of the current slot and its x is clicked
-- **THEN** the preview fades away and the window is no longer part of the slot
+#### Scenario: The app keeps the window
+- **WHEN** the window's app doesn't close it (for example it only hides to its tray)
+- **THEN** the preview returns to normal after about three seconds and the window stays in its slot
+
+#### Scenario: Release before the close finishes
+- **WHEN** the user clicks an x, releases `Ctrl+Alt`, and the window finishes closing a few seconds later
+- **THEN** the window is still removed from its slot and from the state file, and a slot it emptied is removed
 
 #### Scenario: Release over an x
 - **WHEN** the user releases `Ctrl+Alt` with the cursor on a preview's x

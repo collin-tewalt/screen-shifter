@@ -28,7 +28,7 @@ Closing slot `i` of a monitor with two or more slots SHALL remove it and move it
 - **THEN** on the next start every window the state file lists is shown or placed in a slot, none left hidden
 
 ### Requirement: A closed window is forgotten from its slot
-When a window recorded in a hidden slot is closed from the exposé, the system SHALL remove it, and any of its recorded owned windows that no longer exist, from the slot and from the state file. A hidden slot that this empties SHALL be removed like any empty slot. Removing a window MUST NOT affect any other slot or monitor.
+Whenever the system notices that a window recorded in a hidden slot no longer exists (when a close requested from the exposé finishes, and when the panel opens), it SHALL remove that window, and any recorded owned windows that no longer exist, from its slot and from the state file. A hidden slot this empties SHALL be removed like any empty slot. A window that still exists MUST NOT be removed, wherever it now is. Removing dead windows MUST NOT affect any other entry.
 
 #### Scenario: Last window closed
 - **WHEN** slot 3 holds one hidden window and it is closed from its preview
@@ -37,3 +37,7 @@ When a window recorded in a hidden slot is closed from the exposé, the system S
 #### Scenario: Other windows remain
 - **WHEN** a hidden slot holds two windows and one is closed
 - **THEN** the slot holds the other and keeps its number
+
+#### Scenario: A pending close and a switch
+- **WHEN** a close was requested for a window, and before it finishes the monitor switches slots so the window is hidden
+- **THEN** the window stays recorded in its slot until it no longer exists
