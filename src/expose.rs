@@ -222,6 +222,8 @@ struct Tx {
     begin: i64,
     begin_ms: u64,
     dur: u64,
+    /// Held at the start values this long before the motion runs.
+    delay: u64,
 }
 
 impl Tx {
@@ -231,13 +233,13 @@ impl Tx {
 
     /// A transition starting `delay_ms` after the next frame.
     fn after(g: &Gpu, dur: u64, delay_ms: u64) -> R<Tx> {
-        let (begin, begin_ms) = gpu::begin_time(&g.dcomp, delay_ms)?;
-        Ok(Tx { dcomp: g.dcomp.clone(), begin, begin_ms, dur })
+        let (begin, begin_ms) = gpu::begin_time(&g.dcomp, 0)?;
+        Ok(Tx { dcomp: g.dcomp.clone(), begin, begin_ms, dur, delay: delay_ms })
     }
 
     fn anim(&self, from: f32, to: f32) -> R<IDCompositionAnimation> {
         let m = crate::anim::Motion { from, to, start: self.begin_ms, dur: self.dur };
-        gpu::animation(&self.dcomp, &m, self.begin)
+        if self.delay > 0 { gpu::animation_after(&self.dcomp, &m, self.begin, self.delay) } else { gpu::animation(&self.dcomp, &m, self.begin) }
     }
 
     fn rect(&self, p: &Preview, from: Rect, to: Rect) -> R<()> {
@@ -285,8 +287,15 @@ fn add_icon(tx: &Tx, surfaces: &HashMap<String, Pic>, keys: &HashMap<u64, String
     if p.icon.is_some() || p.gone {
         return Ok(());
     }
-    let Some((surface, w, h)) = keys.get(&p.id).and_then(|k| surfaces.get(k)) else { return Ok(()) };
-    let Some(r) = icon_place(p.cell, set.scale, w.max(*h)) else { return Ok(()) };
+    let Some((surface, w, h)) = keys.get(&p.id).and_then(|k| surfaces.get(k)) else {
+        crate::log!("icon: {:x} has no picture yet (key known: {})", p.id, keys.contains_key(&p.id));
+        return Ok(());
+    };
+    let Some(r) = icon_place(p.cell, set.scale, w.max(*h)) else {
+        crate::log!("icon: {:x} preview too small ({}x{})", p.id, p.cell.w, p.cell.h);
+        return Ok(());
+    };
+    crate::log!("icon: {:x} at {:.0},{:.0} {:.0}px (picture {w}x{h})", p.id, r.x, r.y, r.w);
     unsafe {
         let visual = tx.dcomp.CreateVisual()?;
         visual.SetContent(surface)?;
@@ -711,7 +720,7 @@ pub fn snapshots_arrived(shots: Vec<crate::snap::Shot>) {
                 if let Some(p) = set.previews.iter_mut().find(|p| p.id == id) {
                     unsafe { p.visual.SetContent(&s.0)? };
                     (p.sw, p.sh) = (s.1, s.2);
-                    let tx = Tx { dcomp: g.dcomp.clone(), begin: 0, begin_ms: 0, dur: 0 };
+                    let tx = Tx { dcomp: g.dcomp.clone(), begin: 0, begin_ms: 0, dur: 0, delay: 0 };
                     tx.rect(p, p.cell, p.cell)?;
                     changed = true;
                 }

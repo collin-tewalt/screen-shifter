@@ -357,6 +357,22 @@ pub fn animation(dcomp: &IDCompositionDesktopDevice, m: &Motion, begin: i64) -> 
     }
 }
 
+/// Like `animation`, but holding `m.from` for `delay_ms` first. The wait is part of the
+/// animation (begun at `begin`, a frame away like every other) instead of a begin time in the
+/// future, so it can't be applied late or not at all.
+pub fn animation_after(dcomp: &IDCompositionDesktopDevice, m: &Motion, begin: i64, delay_ms: u64) -> windows::core::Result<IDCompositionAnimation> {
+    let (secs, wait) = (m.dur.max(1) as f64 / 1000.0, delay_ms as f64 / 1000.0);
+    let (c, l, q, k) = cubic_coeffs(m.from, m.to, secs as f32);
+    unsafe {
+        let a = dcomp.CreateAnimation()?;
+        a.SetAbsoluteBeginTime(begin)?;
+        a.AddCubic(0.0, m.from, 0.0, 0.0, 0.0)?;
+        a.AddCubic(wait, c, l, q, k)?;
+        a.End(wait + secs, m.to)?;
+        Ok(a)
+    }
+}
+
 /// Blocks until the last commit is in the compositor (then one DwmFlush puts it on screen).
 pub fn wait_committed() {
     GPU.with(|g| {
