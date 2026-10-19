@@ -226,6 +226,26 @@ impl State {
         Some(Closed { plan: Plan { show: shown, hide: vec![] }, receiver })
     }
 
+    /// Forgets every window recorded in a hidden slot for which `alive` is false (closed
+    /// while hidden), and the slots that empties. A window that still exists is never
+    /// removed, wherever it is. True if any slot lost a window.
+    pub fn forget_dead(&mut self, alive: impl Fn(u64) -> bool) -> bool {
+        let mut any = false;
+        for m in self.monitors.values_mut() {
+            for slot in &mut m.slots {
+                let n = slot.len();
+                slot.retain(|e| alive(e.id));
+                any |= slot.len() != n;
+            }
+            if let Some((plan, _)) = &mut m.last {
+                plan.hide.retain(|e| alive(e.id));
+                plan.show.retain(|e| alive(e.id));
+            }
+            m.prune();
+        }
+        any
+    }
+
     fn prune_all(&mut self) {
         for m in self.monitors.values_mut() {
             m.prune();
@@ -756,6 +776,42 @@ mod tests {
         s.close_slot(A, 0, 10).unwrap(); // w1 is shown again
         let p = new(&mut s, A, vec![], 20); // enumeration doesn't list it yet
         assert_eq!(ids(&p.hide), [1]);
+    }
+
+    #[test]
+    fn dead_windows_leave_their_slots_and_empty_slots_go() {
+        let mut s = State::default();
+        new(&mut s, A, vec![w(1), w(2)], 0); // [w1 w2] [active]
+        new(&mut s, A, vec![w(3)], LATER); // [w1 w2] [w3] [active]
+        assert!(s.forget_dead(|id| id != 2));
+        assert_eq!(ids(&s.slots(A).1[0]), [1], "other windows keep the slot");
+        assert!(s.forget_dead(|id| id != 3));
+        assert_eq!((s.count(A), s.active(A)), (2, 2), "the emptied slot went and the rest renumbered");
+        assert!(!s.forget_dead(|_| true), "nothing dead: nothing changes");
+    }
+
+    #[test]
+    fn a_live_window_is_never_forgotten_wherever_it_is() {
+        let mut s = State::default();
+        new(&mut s, A, vec![w(1)], 0);
+        // w1 is moved to a hidden slot on the other monitor while a close of it is pending
+        s.move_to_slot(&[w(1)], A, Some(0), B, Target::New, LATER);
+        assert!(!s.forget_dead(|_| true));
+        assert_eq!(s.hidden().len(), 1, "still recorded");
+        // and the active slot and other monitor's entries are untouched when another one dies
+        new(&mut s, A, vec![w(5)], 2 * LATER);
+        assert!(s.forget_dead(|id| id != 5));
+        assert_eq!(ids(&s.hidden()), [1]);
+    }
+
+    #[test]
+    fn dead_windows_leave_the_race_plan_too() {
+        let mut s = State::default();
+        new(&mut s, A, vec![w(1), w(2)], 0);
+        prev(&mut s, A, vec![], 10); // shows w1 w2: the plan remembers them as shown
+        s.forget_dead(|id| id != 2);
+        let p = new(&mut s, A, vec![], 20); // the enumeration hasn't caught up yet
+        assert_eq!(ids(&p.hide), [1], "the dead window is not re-captured from the plan");
     }
 
     #[test]

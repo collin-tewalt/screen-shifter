@@ -16,6 +16,7 @@ Hold **`Ctrl+Alt`** to bring up a panel on every monitor showing what's in each 
 | Press on a window and drag onto a tile | Move that window into that slot (either monitor) |
 | Drag a window onto **+ New** | Put it in a new slot at the end |
 | Rest on a tile | Exposé: that slot's windows spread across its monitor over a frosted backdrop, each preview with its app's icon at the bottom-left |
+| Click the **×** at a preview's top-right | Ask that window's app to close it (the same request as its own close button, so "save changes?" prompts still appear). The preview dims until the window is gone; if the app keeps it, the preview comes back |
 | Click a preview (or release `Ctrl+Alt` on it) | Switch to its slot and bring that window to the front |
 | Drag a preview onto a tile | Move that window into that slot, even if it's hidden right now |
 

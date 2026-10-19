@@ -68,6 +68,12 @@ const HOVER_TIMER: usize = 4;
 const EXPOSE_TIMER: usize = 5;
 const EXPOSE_WAIT_MS: u32 = 300;
 const HOVER_MS: u32 = 300;
+/// Watches windows asked to close from the exposé.
+const CLOSE_TIMER: usize = 6;
+const CLOSE_POLL_MS: u32 = 250;
+/// A window that hasn't closed by now gets its preview back (it keeps being watched).
+const CLOSE_UNDIM_MS: u64 = 3000;
+const CLOSE_GIVE_UP_MS: u64 = 60_000;
 
 thread_local! {
     static STATE: RefCell<core::State> = RefCell::default();
@@ -86,6 +92,10 @@ thread_local! {
     /// under it, so the release must not switch to whatever tile is there now (until the
     /// mouse has moved away).
     static CLOSED_BY_X: Cell<Option<POINT>> = const { Cell::new(None) };
+    /// The preview whose x was pressed (acts if the release is on the same x).
+    static PRESSED_CLOSE_WINDOW: Cell<Option<u64>> = const { Cell::new(None) };
+    /// Windows asked to close from the exposé, and not yet settled.
+    static CLOSING: RefCell<Vec<Closing>> = const { RefCell::new(Vec::new()) };
     /// Window being dragged: its monitor and root + owned entries
     static DRAGGING: RefCell<Option<(String, Vec<Entry>)>> = const { RefCell::new(None) };
     /// A modal loop (tray menu) is running: our frame loop can't step animations.
@@ -112,6 +122,35 @@ thread_local! {
     static ICONS: Cell<[Option<HICON>; 4]> = const { Cell::new([None; 4]) };
 }
 static TASKBAR_CREATED: AtomicU32 = AtomicU32::new(0);
+
+/// A window asked to close.
+struct Closing {
+    entry: Entry,
+    started: u64,
+    /// its preview already came back to normal
+    undimmed: bool,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum Poll {
+    Wait,
+    Undim,
+    Gone,
+    Drop,
+}
+
+/// What to do about a window asked to close: `same` = it is still the very window.
+fn poll_close(same: bool, undimmed: bool, age_ms: u64) -> Poll {
+    if !same {
+        Poll::Gone
+    } else if age_ms >= CLOSE_GIVE_UP_MS {
+        Poll::Drop
+    } else if !undimmed && age_ms >= CLOSE_UNDIM_MS {
+        Poll::Undim
+    } else {
+        Poll::Wait
+    }
+}
 
 fn main() {
     if std::env::args().any(|a| a == "--list") {
@@ -360,6 +399,13 @@ fn cancel_expose_wait() {
 /// Mouse moved with the panel up (not dragging): open, swap, highlight, or collapse.
 fn on_hover(pt: POINT) {
     panel::set_close_hover(pt);
+    // On a preview's x: that x is hot and the preview isn't highlighted, so a release here chooses nothing.
+    let on_badge = expose::close_at(pt);
+    expose::set_close_hot(on_badge);
+    if on_badge.is_some() {
+        expose::set_hover(None);
+        return;
+    }
     let latched = hooks::PANEL_LATCH.load(SeqCst);
     let open = expose::open_slot();
     let hold = DROP_HOLD.with(|h| h.borrow().clone());
@@ -479,6 +525,134 @@ fn choose(id: u64) {
 /// Hook-driven switches pick the monitor from the posted point, not a fresh cursor read.
 fn switch_at(pt: POINT, dir: Dir) {
     on_switch(win::monitor_at(pt).0, dir);
+}
+
+/// The x on a preview: ask the window's app to close it, as its own close button does. The
+/// preview dims and is inert until the window is gone (then it fades away) or stays (3 s).
+fn request_close(id: u64) {
+    let Some((_, _, _, entry)) = expose::chosen(id) else { return };
+    if CLOSING.with(|c| c.borrow().iter().any(|x| x.entry.id == id)) {
+        return;
+    }
+    if !win::is_same(&entry) {
+        // already gone (or the handle was reused): never send a request to whatever has it now
+        expose::fade_out(id, motion_on());
+        reap_dead();
+        collapse_if_empty();
+        return;
+    }
+    let posted = unsafe { PostMessageW(Some(win::hwnd(id)), WM_SYSCOMMAND, WPARAM(SC_CLOSE as usize), LPARAM(0)) };
+    if posted.is_err() {
+        log!("close {:x}: request refused", id);
+        return;
+    }
+    log!("close {:x}: asked", id);
+    expose::dim_preview(id, true);
+    CLOSING.with(|c| c.borrow_mut().push(Closing { entry, started: win::now_ms(), undimmed: false }));
+    unsafe {
+        SetTimer(Some(APP.get()), CLOSE_TIMER, CLOSE_POLL_MS, None);
+    }
+}
+
+/// An exposé with nothing left in it folds away.
+fn collapse_if_empty() {
+    if panel::is_shown() && expose::open_slot().is_some() && expose::live() == 0 {
+        expose::collapse(motion_on());
+        arm_anim_timer();
+    }
+}
+
+fn on_close_timer() {
+    if hooks::DRAG.load(SeqCst) {
+        return; // never rebuild the panel or spread under a drag: the next tick looks again
+    }
+    let now = win::now_ms();
+    let (mut undim, mut gone) = (vec![], vec![]);
+    CLOSING.with(|c| {
+        c.borrow_mut().retain_mut(|x| match poll_close(win::is_same(&x.entry), x.undimmed, now.saturating_sub(x.started)) {
+            Poll::Wait => true,
+            Poll::Undim => {
+                x.undimmed = true;
+                undim.push(x.entry.id);
+                true
+            }
+            Poll::Gone => {
+                gone.push(x.entry.id);
+                false
+            }
+            Poll::Drop => false,
+        });
+        if c.borrow().is_empty() {
+            unsafe {
+                let _ = KillTimer(Some(APP.get()), CLOSE_TIMER);
+            }
+        }
+    });
+    for id in undim {
+        expose::dim_preview(id, false);
+    }
+    if !gone.is_empty() {
+        for id in gone {
+            expose::fade_out(id, motion_on());
+        }
+        reap_dead();
+        collapse_if_empty();
+    }
+    arm_anim_timer();
+}
+
+/// Forgets windows that no longer exist: from the hidden slots (and so the state file), from
+/// the visible lists, and from the panel. A slot that empties goes, and a spread that named the
+/// renumbered slots folds. Only windows that are gone are ever removed.
+fn reap_dead() {
+    if hooks::DRAG.load(SeqCst) {
+        return;
+    }
+    let alive = |id: u64| unsafe { IsWindow(Some(win::hwnd(id))).as_bool() };
+    let names = win::monitor_names();
+    let counts = |s: &core::State| -> Vec<usize> { names.iter().map(|n| s.count(n)).collect() };
+    let (removed, before, after) = STATE.with(|s| {
+        let mut s = s.borrow_mut();
+        let before = counts(&s);
+        let removed = s.forget_dead(alive);
+        (removed, before, counts(&s))
+    });
+    let trimmed = VISIBLE.with(|v| {
+        let mut changed = false;
+        for list in v.borrow_mut().values_mut() {
+            let n = list.len();
+            list.retain(|e| alive(e.id));
+            changed |= list.len() != n;
+        }
+        changed
+    });
+    if !removed && !trimmed {
+        return;
+    }
+    if removed {
+        persist(&[]); // removing windows that are gone can't strand any
+    }
+    let renumbered: Vec<&String> = names.iter().zip(before.iter().zip(&after)).filter(|(_, (b, a))| b != a).map(|(n, _)| n).collect();
+    if !renumbered.is_empty() {
+        stop_hover();
+        DROP_HOLD.with(|h| h.borrow_mut().take());
+        PRESSED.with(|p| p.borrow_mut().take());
+        PRESSED_CLOSE.with(|p| p.borrow_mut().take());
+        for m in renumbered {
+            expose::collapse_monitor(m, motion_on()); // its spread names slots that renumbered
+        }
+        arm_anim_timer();
+    }
+    if panel::is_shown() {
+        let data = names
+            .iter()
+            .map(|n| {
+                let visible = VISIBLE.with(|v| v.borrow().get(n).cloned().unwrap_or_default());
+                panel_data_for(n.clone(), &visible)
+            })
+            .collect();
+        panel::update(data);
+    }
 }
 
 /// The x on a slot tile: the slot folds into its neighbor on the left (the right for the first).
@@ -775,6 +949,7 @@ fn request_icons() {
 
 fn show_panels() {
     CLOSED_BY_X.set(None);
+    reap_dead(); // windows that closed while hidden
     win::icon_budget(true); // icons are looked up afresh each time the panel opens
     panel::show(&win::monitors(), panel_data());
     hooks::HOVER.store(true, SeqCst);
@@ -830,6 +1005,10 @@ fn on_ldown(pt: POINT) {
         return;
     }
     // The exposé first: its overlay is click-through, so the window under it would start a drag.
+    if let Some(id) = expose::close_at(pt) {
+        PRESSED_CLOSE_WINDOW.set(Some(id));
+        return;
+    }
     if let Some(i) = expose::preview_at(pt) {
         PRESSED_PREVIEW.set(Some((i, pt)));
         return;
@@ -903,6 +1082,12 @@ fn on_lup(pt: POINT) {
         }
         return;
     }
+    if let Some(id) = PRESSED_CLOSE_WINDOW.take() {
+        if expose::close_at(pt) == Some(id) {
+            request_close(id); // the exposé stays up, in swipe mode too
+        }
+        return;
+    }
     if let Some((i, _)) = PRESSED_PREVIEW.take() {
         if expose::preview_at(pt) == Some(i) {
             choose(i);
@@ -939,6 +1124,7 @@ fn end_panel_mode() {
     hooks::HOVER.store(false, SeqCst);
     stop_hover();
     PRESSED_PREVIEW.set(None);
+    PRESSED_CLOSE_WINDOW.set(None);
     PRESSED.with(|p| p.borrow_mut().take());
     PRESSED_CLOSE.with(|p| p.borrow_mut().take());
     CLOSED_BY_X.set(None);
@@ -1147,6 +1333,7 @@ unsafe extern "system" fn app_proc(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) ->
                     spread_all_now();
                 }
             }
+            WM_TIMER if wp.0 == CLOSE_TIMER => on_close_timer(),
             WM_TIMER if wp.0 == EXPOSE_TIMER => {
                 let _ = KillTimer(Some(h), EXPOSE_TIMER);
                 if EXPOSE_WAIT.replace(false) {
@@ -1192,6 +1379,7 @@ unsafe extern "system" fn app_proc(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) ->
                     }
                 }
                 PRESSED_PREVIEW.set(None);
+                PRESSED_CLOSE_WINDOW.set(None);
                 cancel_drag();
                 panel::hide();
                 WHEEL.set(0);
@@ -1249,6 +1437,7 @@ unsafe extern "system" fn app_proc(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) ->
 fn shutdown(app: HWND) {
     unsafe {
         let _ = EndMenu(); // a close request can arrive while the tray menu is open
+        let _ = KillTimer(Some(app), CLOSE_TIMER);
         cancel_drag();
         panel::hide();
         if let Some(h) = HOOKS.with(|h| h.borrow_mut().take()) {
@@ -1331,5 +1520,20 @@ unsafe fn tray_menu(app: HWND) {
             }
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod close_tests {
+    use super::*;
+
+    #[test]
+    fn a_window_asked_to_close_is_gone_undimmed_or_given_up_on() {
+        assert_eq!(poll_close(true, false, 100), Poll::Wait);
+        assert_eq!(poll_close(false, false, 100), Poll::Gone, "gone, or its handle was reused");
+        assert_eq!(poll_close(true, false, CLOSE_UNDIM_MS), Poll::Undim);
+        assert_eq!(poll_close(true, true, CLOSE_UNDIM_MS + 1000), Poll::Wait, "undimming is once");
+        assert_eq!(poll_close(false, true, 10_000), Poll::Gone, "still noticed after the undim");
+        assert_eq!(poll_close(true, true, CLOSE_GIVE_UP_MS), Poll::Drop);
     }
 }

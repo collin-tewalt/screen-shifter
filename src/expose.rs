@@ -38,6 +38,10 @@ const ICON_RANGE: (f32, f32) = (32.0, 72.0);
 const ICON_MIN_CELL: f32 = 120.0;
 /// Icon pictures kept on the GPU (apps, not windows).
 const ICON_SURFACES: usize = 64;
+/// The close badge on each preview: (diameter, inset from the corner) at 100%.
+const BADGE: (f32, f32) = (24.0, 8.0);
+/// A preview whose window was asked to close.
+const DIMMED: f32 = 0.4;
 const MARGIN: f32 = 48.0;
 const HIGHLIGHT: f32 = 4.0;
 const ACCENT: u32 = 0xFF00_78D7; // BGRA of the panel accent
@@ -122,6 +126,41 @@ struct Preview {
     gone: bool,
     /// The app icon at its bottom-left, once known.
     icon: Option<IDCompositionEffectGroup>,
+    /// The close x at its top-right.
+    badge: Option<Badge>,
+    /// Its window was asked to close: the preview is inert until that's settled.
+    dimmed: bool,
+}
+
+struct Badge {
+    visual: IDCompositionVisual2,
+    fx: IDCompositionEffectGroup,
+    /// in monitor coordinates
+    rect: Rect,
+    size: i32,
+}
+
+/// The close x: a disc with a white cross, premultiplied BGRA, anti-aliased. `hot`: red, for
+/// when the cursor is on it.
+fn close_badge(size: i32, hot: bool) -> Vec<u32> {
+    let n = size as f32;
+    let c = n / 2.0;
+    let r = c - 0.5;
+    let (rgb, alpha) = if hot { ([0xC4 as f32, 0x2B as f32, 0x1C as f32], 0.95) } else { ([0x2B as f32; 3], 0.85) };
+    let (arm, half) = (n * 0.22, n * 0.055);
+    let cover = |v: f32| v.clamp(0.0, 1.0);
+    (0..size * size)
+        .map(|i| {
+            let (x, y) = ((i % size) as f32 + 0.5 - c, (i / size) as f32 + 0.5 - c);
+            let disc = cover(r - (x * x + y * y).sqrt() + 0.5) * alpha;
+            let reach = cover(arm + 0.5 - x.abs()) * cover(arm + 0.5 - y.abs());
+            let line = |d: f32| cover(half + 0.5 - d.abs() / std::f32::consts::SQRT_2) * reach;
+            let cross = line(x - y).max(line(x + y));
+            let a = cross + disc * (1.0 - cross);
+            let ch = |k: usize| ((cross + rgb[k] / 255.0 * disc * (1.0 - cross)).min(a) * 255.0).round() as u32;
+            (((a * 255.0).round() as u32) << 24) | (ch(0) << 16) | (ch(1) << 8) | ch(2)
+        })
+        .collect()
 }
 
 /// Where a preview's icon goes (the preview is `cell`) and how big it is drawn: a share of the
@@ -190,6 +229,10 @@ pub struct State {
     /// App icon pictures by app key, and each window's key.
     icon_surfaces: HashMap<String, Pic>,
     icon_keys: HashMap<u64, String>,
+    /// Close badge pictures by size: (normal, hot).
+    badges: HashMap<i32, (Pic, Pic)>,
+    /// The preview whose badge is under the cursor.
+    hot_close: Option<u64>,
     /// One spread per monitor (several at once in the swipe-opened exposé).
     open: Vec<Set>,
     closing: Vec<Set>,
@@ -313,6 +356,54 @@ fn add_icon(tx: &Tx, surfaces: &HashMap<String, Pic>, keys: &HashMap<u64, String
         set.previews[i].icon = Some(fx); // the container keeps the visual
     }
     Ok(())
+}
+
+/// The badge pictures for `size`, uploaded once.
+fn badge_pics(g: &mut Gpu, size: i32) -> R<(Pic, Pic)> {
+    if let Some(b) = g.expose.badges.get(&size) {
+        return Ok(b.clone());
+    }
+    let up = |g: &Gpu, hot| -> R<Pic> { Ok((gpu::surface_from_pixels(g, size, size, &close_badge(size, hot), true)?, size as f32, size as f32)) };
+    let pair = (up(g, false)?, up(g, true)?);
+    g.expose.badges.insert(size, pair.clone());
+    Ok(pair)
+}
+
+/// Gives preview `i` its close badge, fading in with `tx`.
+fn add_badge(tx: &Tx, pics: &(Pic, Pic), set: &mut Set, i: usize, size: i32) -> R<()> {
+    let p = &set.previews[i];
+    if p.badge.is_some() || p.gone {
+        return Ok(());
+    }
+    let s = size as f32;
+    let inset = BADGE.1 * set.scale;
+    let rect = Rect { x: p.cell.x + p.cell.w - inset - s, y: p.cell.y + inset, w: s, h: s };
+    unsafe {
+        let visual = tx.dcomp.CreateVisual()?;
+        visual.SetContent(&pics.0.0)?;
+        visual.SetOffsetX2(rect.x)?;
+        visual.SetOffsetY2(rect.y)?;
+        let fx = tx.dcomp.CreateEffectGroup()?;
+        fx.SetOpacity2(0.0)?;
+        visual.SetEffect(&fx)?;
+        set.icons.AddVisual(&visual, false, None::<&IDCompositionVisual>)?;
+        tx.opacity(&fx, 0.0, 1.0)?;
+        set.previews[i].badge = Some(Badge { visual, fx, rect, size });
+    }
+    Ok(())
+}
+
+/// Back to the normal picture on whichever badge was hot.
+fn unhot(g: &mut Gpu) -> R<()> {
+    let Some(id) = g.expose.hot_close.take() else { return Ok(()) };
+    for set in &g.expose.open {
+        if let Some(b) = set.previews.iter().find(|p| p.id == id).and_then(|p| p.badge.as_ref())
+            && let Some(pair) = g.expose.badges.get(&b.size)
+        {
+            unsafe { b.visual.SetContent(&pair.0.0)? };
+        }
+    }
+    unsafe { g.dcomp.Commit() }
 }
 
 /// A 1×1 surface of one color, stretched by a scale transform.
@@ -487,7 +578,7 @@ fn open_in(g: &mut Gpu, monitor: &str, slot: usize, current: bool, roots: &[(Ent
                 (false, Some(t)) => (t.fit(cell.w, cell.h), true),
                 _ => (client(*r, mon), false),
             };
-            let p = Preview { id: e.id, visual, scale: st, fx, sw, sh, home, cell, from_tile, cx: 0.0, cy: 0.0, gone: false, icon: None };
+            let p = Preview { id: e.id, visual, scale: st, fx, sw, sh, home, cell, from_tile, cx: 0.0, cy: 0.0, gone: false, icon: None, badge: None, dimmed: false };
             tx.rect(&p, home, cell)?;
             tx.opacity(&p.fx, if from_tile { 0.0 } else { 1.0 }, 1.0)?;
             previews.push(p);
@@ -513,8 +604,11 @@ fn open_in(g: &mut Gpu, monitor: &str, slot: usize, current: bool, roots: &[(Ent
         // Icons already known fade in once the spread has settled.
         let k = g.expose.open.len() - 1;
         let itx = Tx::after(g, if motion { ICON_FADE_MS } else { 0 }, if motion { OPEN_MS } else { 0 })?;
+        let size = (BADGE.0 * scale).round() as i32;
+        let pics = badge_pics(g, size)?;
         for i in 0..g.expose.open[k].previews.len() {
             add_icon(&itx, &g.expose.icon_surfaces, &g.expose.icon_keys, &mut g.expose.open[k], i)?;
+            add_badge(&itx, &pics, &mut g.expose.open[k], i, size)?;
         }
         g.dcomp.Commit()?;
     }
@@ -551,6 +645,9 @@ fn restack(set: &Set) -> R<()> {
 
 /// Folds one spread back into its windows or tile, fading its dimming.
 fn fold(g: &mut Gpu, mut set: Set, motion: bool) -> R<()> {
+    if set.previews.iter().any(|p| Some(p.id) == g.expose.hot_close) {
+        g.expose.hot_close = None;
+    }
     restack(&set)?;
     let dur = if motion { CLOSE_MS } else { 0 };
     let tx = Tx::new(g, dur)?;
@@ -583,7 +680,7 @@ pub fn chosen(id: u64) -> Option<(String, usize, bool, Entry)> {
     gpu::with_existing(|g| {
         // previews and entries are in the same order
         Ok(g.expose.open.iter().find_map(|s| {
-            let i = s.previews.iter().position(|p| p.id == id)?;
+            let i = s.previews.iter().position(|p| p.id == id && !p.gone)?;
             Some((s.monitor.clone(), s.slot, s.current, s.entries.get(i)?.clone()))
         }))
     })
@@ -596,6 +693,7 @@ pub fn choose(id: u64, target: Option<RECT>, motion: bool) {
     gpu::with_existing(|g| {
         let sets = std::mem::take(&mut g.expose.open);
         g.expose.hovered = None;
+        g.expose.hot_close = None;
         let dur = if motion { CHOOSE_MS } else { 0 };
         let tx = Tx::new(g, dur)?;
         let icons_out = Tx::new(g, if motion { ICON_OUT_MS } else { 0 })?;
@@ -647,7 +745,7 @@ pub fn preview_at(pt: POINT) -> Option<u64> {
         let dragged = g.expose.drag.as_ref().map(|d| d.id);
         Ok(g.expose.open.iter().find(|s| inside(s.mon, pt)).and_then(|s| {
             let (x, y) = ((pt.x - s.mon.left) as f32, (pt.y - s.mon.top) as f32);
-            s.previews.iter().rev().find(|p| !p.gone && Some(p.id) != dragged && p.cell.contains(x, y)).map(|p| p.id)
+            s.previews.iter().rev().find(|p| !p.gone && !p.dimmed && Some(p.id) != dragged && p.cell.contains(x, y)).map(|p| p.id)
         }))
     })
     .flatten()
@@ -664,6 +762,91 @@ pub fn dim_at(pt: POINT) -> bool {
     };
     let on_panel = crate::panel::window_of(&monitor).is_some_and(|(_, r)| inside(r, pt));
     !on_panel && preview_at(pt).is_none()
+}
+
+/// The preview whose close x is under a screen point.
+pub fn close_at(pt: POINT) -> Option<u64> {
+    gpu::with_existing(|g| {
+        let dragged = g.expose.drag.as_ref().map(|d| d.id);
+        Ok(g.expose.open.iter().find(|s| inside(s.mon, pt)).and_then(|s| {
+            let (x, y) = ((pt.x - s.mon.left) as f32, (pt.y - s.mon.top) as f32);
+            s.previews
+                .iter()
+                .rev()
+                .find(|p| !p.gone && !p.dimmed && Some(p.id) != dragged && p.badge.as_ref().is_some_and(|b| b.rect.contains(x, y)))
+                .map(|p| p.id)
+        }))
+    })
+    .flatten()
+}
+
+/// Makes the close x of preview `id` red (None: none is).
+pub fn set_close_hot(id: Option<u64>) {
+    gpu::with_existing(|g| {
+        if g.expose.hot_close == id {
+            return Ok(());
+        }
+        unhot(g)?;
+        if let Some(id) = id {
+            for set in &g.expose.open {
+                if let Some(b) = set.previews.iter().find(|p| p.id == id).and_then(|p| p.badge.as_ref())
+                    && let Some(pair) = g.expose.badges.get(&b.size)
+                {
+                    unsafe { b.visual.SetContent(&pair.1.0)? };
+                    g.expose.hot_close = Some(id);
+                }
+            }
+            unsafe { g.dcomp.Commit()? };
+        }
+        Ok(())
+    });
+}
+
+/// Dims preview `id` while its window is asked to close (and makes it inert), or restores it.
+pub fn dim_preview(id: u64, on: bool) {
+    gpu::with_existing(|g| {
+        if on && g.expose.hovered == Some(id) {
+            g.expose.hovered = None;
+            for set in &g.expose.open {
+                unsafe { set.highlight.2.SetOpacity2(0.0)? };
+            }
+        }
+        for set in g.expose.open.iter_mut() {
+            if let Some(p) = set.previews.iter_mut().find(|p| p.id == id && !p.gone) {
+                p.dimmed = on;
+                unsafe { p.fx.SetOpacity2(if on { DIMMED } else { 1.0 })? };
+            }
+        }
+        unsafe { g.dcomp.Commit() }
+    });
+}
+
+/// The window of preview `id` is gone: the preview, its icon and its x fade away.
+pub fn fade_out(id: u64, motion: bool) {
+    gpu::with_existing(|g| {
+        let tx = Tx::new(g, if motion { CLOSE_MS } else { 0 })?;
+        if g.expose.hovered == Some(id) {
+            g.expose.hovered = None;
+            for set in &g.expose.open {
+                unsafe { set.highlight.2.SetOpacity2(0.0)? };
+            }
+        }
+        for set in g.expose.open.iter_mut() {
+            if let Some(p) = set.previews.iter_mut().find(|p| p.id == id && !p.gone) {
+                p.gone = true;
+                tx.opacity(&p.fx, if p.dimmed { DIMMED } else { 1.0 }, 0.0)?;
+                unsafe {
+                    if let Some(fx) = &p.icon {
+                        fx.SetOpacity2(0.0)?;
+                    }
+                    if let Some(b) = &p.badge {
+                        b.fx.SetOpacity2(0.0)?;
+                    }
+                }
+            }
+        }
+        unsafe { g.dcomp.Commit() }
+    });
 }
 
 pub fn hovered() -> Option<u64> {
@@ -882,6 +1065,7 @@ pub fn drag_start(id: u64, pt: POINT, motion: bool) -> bool {
             g.expose.drag_layer = Some((o, POINT { x: union.left, y: union.top }));
         }
         let tx = Tx::new(g, if motion { LIFT_MS } else { 0 })?;
+        unhot(g)?;
         let set = &mut g.expose.open[k];
         let i = set.previews.iter().position(|p| p.id == id).expect("held above");
         let p = &mut set.previews[i];
@@ -912,6 +1096,9 @@ pub fn drag_start(id: u64, pt: POINT, motion: bool) -> bool {
             set.highlight.2.SetOpacity2(0.0)?;
             if let Some(fx) = &p.icon {
                 fx.SetOpacity2(0.0)?; // the icon stays behind while its preview is carried
+            }
+            if let Some(b) = &p.badge {
+                b.fx.SetOpacity2(0.0)?;
             }
             g.dcomp.Commit()?;
             let _ = SetWindowPos(layer.hwnd, Some(HWND_TOPMOST), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
@@ -982,6 +1169,9 @@ pub fn drag_end(land: Land, motion: bool) {
                     if let Some(fx) = &p.icon {
                         tx.opacity(fx, 0.0, 1.0)?;
                     }
+                    if let Some(b) = &p.badge {
+                        tx.opacity(&b.fx, 0.0, 1.0)?;
+                    }
                     let at = ((d.last.x - set.mon.left) as f32 - d.c.0, (d.last.y - set.mon.top) as f32 - d.c.1, s.0, s.1);
                     tx.place(p, at, p.place(p.cell))?;
                     if g.expose.flying.is_empty() {
@@ -997,6 +1187,23 @@ pub fn drag_end(land: Land, motion: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn badge_is_a_disc_with_a_cross() {
+        let size = 24;
+        let (n, h) = (close_badge(size, false), close_badge(size, true));
+        let at = |v: &[u32], x: i32, y: i32| v[(y * size + x) as usize];
+        assert_eq!(at(&n, 0, 0) >> 24, 0, "the corner is outside the disc");
+        let centre = at(&n, 12, 12);
+        assert!(centre >> 24 > 240 && (centre & 0xFF) > 240, "the cross is white at the centre");
+        let rim = at(&n, 12, 2); // inside the disc, off both strokes
+        assert!((rim >> 24) > 150 && (rim >> 24) < 255 && (rim & 0xFF) < 100, "dark translucent disc: {rim:08x}");
+        assert!((at(&h, 12, 2) >> 16 & 0xFF) > (rim >> 16 & 0xFF) + 50, "hot is red");
+        assert!(n.iter().chain(&h).all(|&p| {
+            let a = p >> 24;
+            (p >> 16 & 0xFF) <= a && (p >> 8 & 0xFF) <= a && (p & 0xFF) <= a
+        }), "premultiplied");
+    }
 
     #[test]
     fn icon_sits_in_the_bottom_left_and_is_sized_by_the_preview() {

@@ -205,6 +205,12 @@ pub fn icon_of(id: u64) -> HICON {
     icon
 }
 
+/// The very window the entry recorded, still there (a destroyed handle may be reused).
+pub fn is_same(e: &Entry) -> bool {
+    let h = hwnd(e.id);
+    unsafe { IsWindow(Some(h)).as_bool() && core::should_restore(e, pid_of(h), &class_of(h)) }
+}
+
 pub fn title_of(h: HWND) -> String {
     let mut buf = [0u16; 256];
     let n = unsafe { GetWindowTextW(h, &mut buf) };
