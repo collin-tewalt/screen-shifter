@@ -15,7 +15,7 @@ use windows::Win32::System::Registry::{
     HKEY_CURRENT_USER, REG_DWORD, RRF_RT_REG_DWORD, RegDeleteKeyValueW, RegGetValueW, RegSetKeyValueW,
 };
 use windows::Win32::UI::Input::*;
-use windows::Win32::UI::WindowsAndMessaging::{IDYES, MB_ICONQUESTION, MB_YESNO, MessageBoxW};
+use windows::core::PCWSTR;
 use windows::core::w;
 
 /// Digitizer usage page and touch pad usage.
@@ -278,29 +278,29 @@ fn put_back(r: &mut Record) {
     }
 }
 
-fn ask_owner() -> bool {
-    let text = w!(
-        "Let a three-finger swipe up open the slot panel?\n\n\
-         Windows uses that swipe for Task View. Yes turns off Windows' three-finger slide \
-         (Settings > Bluetooth & devices > Touch) while screen-shifter runs, and puts it back \
-         when screen-shifter exits. You can change this from the tray menu."
-    );
-    unsafe { MessageBoxW(None, text, w!("screen-shifter"), MB_YESNO | MB_ICONQUESTION) == IDYES }
-}
+/// The one-time question (asked by the app once it is running; the answer goes to `set_enabled`).
+pub const QUESTION: PCWSTR = w!(
+    "Let a three-finger swipe up open the slot panel?\n\n\
+     Windows uses that swipe for Task View. Yes turns off Windows' three-finger slide \
+     (Settings > Bluetooth & devices > Touch) while Screen Shifter runs, and puts it back \
+     when Screen Shifter exits. You can change this from the tray menu."
+);
 
-/// Startup: put back anything a run that died left changed, ask once, and apply if allowed.
+/// Startup: put back anything a run that died left changed, and apply if the owner said yes
+/// before. Nothing is changed without that yes.
 pub fn startup() {
     let mut r = read_record();
     put_back(&mut r);
-    if r.consent.is_none() {
-        r.consent = Some(ask_owner());
-        write_record(&r);
-    }
     let on = r.consent == Some(true);
     ENABLED.store(on, SeqCst);
     if on {
         apply(&mut r);
     }
+}
+
+/// The owner hasn't been asked yet.
+pub fn needs_question() -> bool {
+    read_record().consent.is_none()
 }
 
 /// The tray's on/off item.

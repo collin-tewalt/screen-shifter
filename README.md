@@ -33,7 +33,9 @@ Without the panel up, a "2 / 3" indicator flashes on that monitor. Whatever is o
 
 Switches animate: a picture of the old slot holds for a moment while the windows underneath settle, then slides off to the left when you move toward the end and to the right when you move toward the start, and quick scrolling peels sheets off back to back. The slide is captured and moved on the GPU by the Windows compositor (Desktop Duplication + DirectComposition), so it stays smooth; where that isn't available (Remote Desktop, a rotated monitor, an unusual display format) it falls back to drawing frames itself. Set `SCREEN_SHIFTER_GDI=1` to force the fallback. A dropped window's ghost flies into its tile (which pulses), glides to its new spot on the other monitor, or springs back if you cancel. Turn animations off with Windows' own **Settings → Accessibility → Visual effects → Animation effects**.
 
-Tray icon (right-click): **Restore all windows**, **Start with Windows** (installed app only; on by default after the first launch, also in Settings → Apps → Startup), **Exit**.
+Tray icon (right-click): **Restore all windows**, **Start with Windows** (installed app only; the first launch asks once, and it's also in Settings → Apps → Startup), **Three-finger swipe opens panel**, **Exit**.
+
+Privacy: Screen Shifter collects nothing and makes no network connections. See [PRIVACY.md](PRIVACY.md).
 
 ## Build
 
@@ -53,6 +55,8 @@ Builds release and writes `dist\screen-shifter-<version>-x64.msix`; the version 
 
 1. Once: `powershell -ExecutionPolicy Bypass -File tools\dev_cert.ps1` (makes `dev-cert.pfx`/`.cer`), then in an admin PowerShell `tools\trust_dev_cert.ps1` (`-Remove` to undo).
 2. `python tools/package.py --sign dev-cert.pfx --password dev`, then `Add-AppxPackage dist\screen-shifter-<version>-x64.msix`.
+
+For the Microsoft Store: `python tools/package.py --store` builds `-store.msix` (unsigned; the Store signs it) with the identity reserved in Partner Center, kept in `packaging/store.json`. See AGENTS.md, "Store release".
 
 Windows won't reinstall the same version with different contents: add `--revision N` (1, 2, …) to sideload a newer build over an installed one, which also exercises the update path. The installed app and `cargo run` builds can't run at the same time (single instance), and keep separate state.
 

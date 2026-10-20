@@ -25,7 +25,7 @@ Practical consequences:
 
 - `cargo run` (debug builds keep a console with timing logs), `cargo test`, `cargo clippy --all-targets -- -D warnings`. In Git Bash, cargo may need `export PATH="$USERPROFILE/.cargo/bin:$PATH"`.
 - Run Windows SDK tools (`makeappx`, `makepri`, `signtool`) from **PowerShell**: Git Bash rewrites `/flag` arguments into paths.
-- Package: `python tools/package.py` (stdlib only; version from `Cargo.toml`, `a.b.c` → `a.b.c.0`). Re-sideloading a newer build of the same version needs `--revision N`.
+- Package: `python tools/package.py` (stdlib only; version from `Cargo.toml`, `a.b.c` → `a.b.c.0`). Re-sideloading a newer build of the same version needs `--revision N`. `--store` builds the Store package (see "Store release").
 - Icons: `python tools/make_icons.py` regenerates every PNG (outputs are committed).
 - `SCREEN_SHIFTER_GDI=1` forces the non-GPU slide fallback.
 
@@ -38,6 +38,21 @@ The dev signing certificate is **per machine and never committed** (it holds a p
 3. `python tools/package.py --sign dev-cert.pfx --password dev`, then `Add-AppxPackage dist\screen-shifter-<version>-x64.msix`.
 
 Store builds are signed by Microsoft; any CI signing would use a certificate from a secret store, never from the repo.
+
+## Store release
+
+The Store signs what is uploaded; nothing here is ever submitted by an agent.
+
+1. **Owner, once:** register as an individual developer at storedeveloper.microsoft.com (free), reserve the name "Screen Shifter", and copy *Product identity* (Package/Identity/Name, Publisher, PublisherDisplayName) into `packaging/store.json` (public values; commit them).
+2. `python tools/package.py --store` → `dist\screen-shifter-<version>-x64-store.msix`, unsigned, revision 0. That is the file to upload.
+3. **Certification kit** (the kit installs the package, so it needs a signed copy, never uploaded):
+   - `powershell -ExecutionPolicy Bypass -File tools\dev_cert.ps1 -Subject "<Publisher from store.json>" -Out store-kit-cert`
+   - owner, admin PowerShell: `tools\trust_dev_cert.ps1 -Cer store-kit-cert.cer`
+   - `python tools/package.py --store --sign store-kit-cert.pfx --password dev` (also writes `-store-kit.msix`)
+   - owner, admin: `& "C:\Program Files (x86)\Windows Kits\10\App Certification Kit\appcert.exe" test -appxpackagepath "<full path>\dist\screen-shifter-<version>-x64-store-kit.msix" -reportoutputpath "<full path>\dist\wack.xml"`
+   - afterwards, owner, admin: `tools\trust_dev_cert.ps1 -Remove -Subject "<Publisher>"` (don't leave a self-signed certificate claiming the Store publisher trusted)
+4. **Owner in Partner Center:** listing from `packaging/store/listing.md`, the `runFullTrust` justification and tester notes from `packaging/store/certification.md`, screenshots per `packaging/store/screenshots.md`, the age rating questionnaire, then submit.
+5. Uninstall the sideloaded dev package before trying the Store one: they are different apps (separate state, both ask their first-run questions), and only one runs at a time.
 
 ## Code map
 

@@ -39,6 +39,8 @@ const HK_PREV: i32 = 1;
 const HK_NEXT: i32 = 2;
 const HK_PANIC: i32 = 3; // debug builds only: failure drill for task 6.3
 const WM_TRAY: u32 = WM_APP + 1;
+/// Posted once startup is done: the one-time questions (touchpad, start with Windows).
+const WM_ASK: u32 = WM_APP + 2;
 const CMD_RESTORE: i32 = 1;
 const CMD_EXIT: i32 = 2;
 const CMD_STARTUP: i32 = 3;
@@ -98,8 +100,14 @@ thread_local! {
     static CLOSING: RefCell<Vec<Closing>> = const { RefCell::new(Vec::new()) };
     /// Window being dragged: its monitor and root + owned entries
     static DRAGGING: RefCell<Option<(String, Vec<Entry>)>> = const { RefCell::new(None) };
-    /// A modal loop (tray menu) is running: our frame loop can't step animations.
+    /// A modal loop (tray menu, a question) is running: our frame loop can't step animations.
     static MODAL: Cell<bool> = const { Cell::new(false) };
+    /// A one-time question is up: the tray icon brings it forward instead of opening the menu.
+    static ASKING: Cell<bool> = const { Cell::new(false) };
+    /// The questions arrived during another modal loop: asked once that loop ends.
+    static ASK_PENDING: Cell<bool> = const { Cell::new(false) };
+    /// `shutdown` has begun: a question that returns now is ignored.
+    static SHUTTING_DOWN: Cell<bool> = const { Cell::new(false) };
     static APP: Cell<HWND> = Cell::new(HWND::default());
     /// The tile the mouse is resting on, waiting for HOVER_TIMER.
     static HOVER_TILE: RefCell<Option<(String, usize)>> = const { RefCell::new(None) };
@@ -178,7 +186,7 @@ fn main() {
         let app = create_windows();
         if let Err(msg) = register_hotkeys(app) {
             win::show_from_file(); // never leave saved windows hidden with no app running
-            MessageBoxW(None, &windows::core::HSTRING::from(msg), w!("screen-shifter"), MB_ICONERROR);
+            MessageBoxW(None, &windows::core::HSTRING::from(msg), w!("Screen Shifter"), MB_ICONERROR);
             return;
         }
         TASKBAR_CREATED.store(RegisterWindowMessageW(w!("TaskbarCreated")), Ordering::Relaxed);
@@ -187,7 +195,8 @@ fn main() {
         // Only now that nothing can fail: take back the saved layout.
         adopt_saved_layout();
         touchpad::register(app);
-        touchpad::startup(); // asks once; applies Windows' three-finger setting if the owner said yes
+        touchpad::startup(); // applies Windows' three-finger setting if the owner said yes before
+        let _ = PostMessageW(Some(app), WM_ASK, WPARAM(0), LPARAM(0)); // the one-time questions
         // If Windows closes us to update the package, it may relaunch us afterwards. Never
         // after a crash (a startup crash would loop) or a reboot (the startup task covers that).
         let _ = RegisterApplicationRestart(None, RESTART_NO_CRASH | RESTART_NO_HANG | RESTART_NO_REBOOT);
@@ -293,7 +302,7 @@ unsafe fn tray(app: HWND, op: NOTIFY_ICON_MESSAGE) {
         hIcon: tray_icon(),
         ..Default::default()
     };
-    let tip: Vec<u16> = "screen-shifter (Ctrl+Alt+\u{2190}/\u{2192})".encode_utf16().collect();
+    let tip: Vec<u16> = "Screen Shifter (Ctrl+Alt+\u{2190}/\u{2192})".encode_utf16().collect();
     nid.szTip[..tip.len()].copy_from_slice(&tip);
     let _ = unsafe { Shell_NotifyIconW(op, &nid) };
 }
@@ -1303,7 +1312,9 @@ unsafe extern "system" fn app_proc(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) ->
                 HK_PANIC => panic!("debug panic drill"),
                 _ => {}
             },
+            WM_TRAY if ASKING.get() && matches!(lp.0 as u32, WM_LBUTTONUP | WM_RBUTTONUP | WM_CONTEXTMENU) => raise_question(),
             WM_TRAY if matches!(lp.0 as u32, WM_RBUTTONUP | WM_CONTEXTMENU) => tray_menu(h),
+            WM_ASK => ask_questions(h),
             hooks::WM_CHORD_DOWN => {
                 SetTimer(Some(h), PANEL_TIMER, PANEL_DELAY_MS, None);
             }
@@ -1435,6 +1446,7 @@ unsafe extern "system" fn app_proc(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) ->
 /// icon, destroy the app window. Safe to call twice. At logoff the process may be killed
 /// as soon as this returns, so nothing may follow DestroyWindow.
 fn shutdown(app: HWND) {
+    SHUTTING_DOWN.set(true); // a question still up must not act on its answer
     unsafe {
         let _ = EndMenu(); // a close request can arrive while the tray menu is open
         let _ = KillTimer(Some(app), CLOSE_TIMER);
@@ -1486,6 +1498,127 @@ fn toggle_startup(task: &StartupTask) {
     }
 }
 
+/// Runs a modal loop (a menu, a message box): our frame loop can't step animations meanwhile,
+/// so none run, and motion stays off until it returns. Safe to nest.
+fn modal<T>(app: HWND, f: impl FnOnce() -> T) -> T {
+    unsafe {
+        let _ = SetForegroundWindow(app);
+    }
+    anim::clear_all();
+    let was = MODAL.replace(true);
+    let r = f();
+    MODAL.set(was);
+    r
+}
+
+/// Asks a Yes/No question in a box with its own taskbar button. None if it was ended any other
+/// way, or the app is shutting down (the answer must not act then).
+fn ask(app: HWND, text: PCWSTR) -> Option<bool> {
+    let answer = modal(app, || unsafe { MessageBoxW(None, text, w!("Screen Shifter"), MB_YESNO | MB_ICONQUESTION | MB_SETFOREGROUND) });
+    if SHUTTING_DOWN.get() || !unsafe { IsWindow(Some(app)).as_bool() } {
+        return None;
+    }
+    match answer {
+        IDYES => Some(true),
+        IDNO => Some(false),
+        _ => None,
+    }
+}
+
+/// The one-time questions, once the app is running: the touchpad, then start with Windows.
+fn ask_questions(app: HWND) {
+    if MODAL.get() {
+        ASK_PENDING.set(true); // asked when the menu that's open now closes
+        return;
+    }
+    ASKING.set(true);
+    let mut go_on = true;
+    if touchpad::needs_question() {
+        match ask(app, touchpad::QUESTION) {
+            Some(yes) => touchpad::set_enabled(yes),
+            None => go_on = false,
+        }
+    }
+    if go_on && startup_record().is_none() {
+        ask_startup(app);
+    }
+    ASKING.set(false);
+}
+
+/// Start with Windows, asked once on an installed package (store policy: consent first).
+fn ask_startup(app: HWND) {
+    let Some(task) = startup_task() else { return }; // a development build
+    let Ok(state) = task.State() else { return };
+    if state != StartupTaskState::Disabled {
+        write_startup_record(Asked::Skipped); // already on, or decided in Settings or by policy
+        return;
+    }
+    let Some(yes) = ask(app, w!("Start Screen Shifter when you sign in?\n\nYou can change this any time from the tray icon.")) else { return };
+    if yes {
+        let _ = task.RequestEnableAsync().and_then(|op| op.join());
+    }
+    write_startup_record(if yes { Asked::Yes } else { Asked::No });
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Asked {
+    Yes,
+    No,
+    /// not asked: the setting was already decided
+    Skipped,
+}
+
+fn parse_asked(text: &str) -> Option<Asked> {
+    text.lines().find_map(|l| match l.trim() {
+        "asked=yes" => Some(Asked::Yes),
+        "asked=no" => Some(Asked::No),
+        "asked=skipped" => Some(Asked::Skipped),
+        _ => None,
+    })
+}
+
+fn format_asked(a: Asked) -> &'static str {
+    match a {
+        Asked::Yes => "asked=yes\n",
+        Asked::No => "asked=no\n",
+        Asked::Skipped => "asked=skipped\n",
+    }
+}
+
+fn startup_record_path() -> std::path::PathBuf {
+    win::state_dir().join("startup.txt")
+}
+
+fn startup_record() -> Option<Asked> {
+    parse_asked(&std::fs::read_to_string(startup_record_path()).ok()?)
+}
+
+fn write_startup_record(a: Asked) {
+    let _ = std::fs::create_dir_all(win::state_dir());
+    let _ = std::fs::write(startup_record_path(), format_asked(a));
+}
+
+/// The tray icon while a question is up: bring the question forward (it may be behind
+/// other windows) instead of opening the menu over it.
+fn raise_question() {
+    unsafe extern "system" fn find(h: HWND, found: LPARAM) -> windows::core::BOOL {
+        let mut class = [0u16; 16];
+        let n = unsafe { GetClassNameW(h, &mut class) };
+        if String::from_utf16_lossy(&class[..n.max(0) as usize]) == "#32770" && unsafe { IsWindowVisible(h).as_bool() } {
+            unsafe { *(found.0 as *mut HWND) = h };
+            return false.into();
+        }
+        true.into()
+    }
+    let mut found = HWND::default();
+    unsafe {
+        let _ = EnumThreadWindows(windows::Win32::System::Threading::GetCurrentThreadId(), Some(find), LPARAM(&mut found as *mut HWND as isize));
+        if !found.is_invalid() {
+            let _ = SetForegroundWindow(found);
+        }
+    }
+}
+
 unsafe fn tray_menu(app: HWND) {
     unsafe {
         let task = startup_task();
@@ -1499,13 +1632,12 @@ unsafe fn tray_menu(app: HWND) {
         let _ = AppendMenuW(menu, MF_STRING, CMD_EXIT as usize, w!("Exit"));
         let mut pt = Default::default();
         let _ = GetCursorPos(&mut pt);
-        let _ = SetForegroundWindow(app); // required for the menu to close on outside click
-        // The menu runs its own modal loop, so our frame loop can't advance sheets meanwhile.
-        anim::clear_all();
-        MODAL.set(true);
-        let cmd = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_NONOTIFY, pt.x, pt.y, None, app, None);
-        MODAL.set(false);
+        // (foreground is also what makes the menu close on an outside click)
+        let cmd = modal(app, || TrackPopupMenu(menu, TPM_RETURNCMD | TPM_NONOTIFY, pt.x, pt.y, None, app, None));
         let _ = DestroyMenu(menu);
+        if ASK_PENDING.take() {
+            let _ = PostMessageW(Some(app), WM_ASK, WPARAM(0), LPARAM(0));
+        }
         match cmd.0 {
             CMD_RESTORE => restore_all(),
             CMD_STARTUP => {
@@ -1535,5 +1667,20 @@ mod close_tests {
         assert_eq!(poll_close(true, true, CLOSE_UNDIM_MS + 1000), Poll::Wait, "undimming is once");
         assert_eq!(poll_close(false, true, 10_000), Poll::Gone, "still noticed after the undim");
         assert_eq!(poll_close(true, true, CLOSE_GIVE_UP_MS), Poll::Drop);
+    }
+}
+
+#[cfg(test)]
+mod startup_record_tests {
+    use super::*;
+
+    #[test]
+    fn the_startup_answer_round_trips() {
+        for a in [Asked::Yes, Asked::No, Asked::Skipped] {
+            assert_eq!(parse_asked(format_asked(a)), Some(a));
+        }
+        assert_eq!(parse_asked(""), None, "never asked");
+        assert_eq!(parse_asked("asked=maybe
+"), None, "unknown means not asked");
     }
 }
