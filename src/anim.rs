@@ -151,10 +151,14 @@ unsafe extern "system" fn sheet_proc(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
 }
 
 /// Our overlays must never appear in captures (or a stale copy would slide away).
+pub fn screenshot_mode() -> bool {
+    std::env::var_os("SCREEN_SHIFTER_SCREENSHOTS").is_some()
+}
+
 /// `SCREEN_SHIFTER_SCREENSHOTS=1` leaves overlays visible to screen capture, for Store
 /// screenshots (the slide and the frosted backdrop may then pick up the panel).
 pub fn exclude_from_capture(h: HWND) {
-    if std::env::var_os("SCREEN_SHIFTER_SCREENSHOTS").is_some() {
+    if screenshot_mode() {
         return;
     }
     unsafe {

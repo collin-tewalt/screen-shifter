@@ -1370,6 +1370,11 @@ unsafe extern "system" fn app_proc(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) ->
                 }
                 return DefWindowProcW(h, msg, wp, lp);
             }
+            // Screenshot mode: releasing Ctrl+Alt leaves the panel (and exposé) up, as a swipe
+            // does, so a delayed snip can catch it; Esc or a click on empty space closes it.
+            hooks::WM_CHORD_UP if wp.0 == hooks::RELEASED && panel::is_shown() && !PREVIEW_DRAG.get() && !hooks::DRAG.load(SeqCst) && anim::screenshot_mode() => {
+                hooks::PANEL_LATCH.store(true, SeqCst);
+            }
             hooks::WM_CHORD_UP => {
                 let _ = KillTimer(Some(h), PANEL_TIMER);
                 stop_hover();
