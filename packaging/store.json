@@ -1,7 +1,7 @@
 {
-  "_comment": "From Partner Center > the app > Product identity, once the name is reserved. Public values: they are in every installed package.",
-  "name": "<Package/Identity/Name>",
-  "publisher": "<Package/Identity/Publisher, CN=...>",
-  "publisher_display": "<Package/Properties/PublisherDisplayName>",
+  "_comment": "From Partner Center > the app > Product identity. Public values: they are in every installed package. Store ID 9MVJDZ8V91SK, PFN SonicScholar.ScreenShifter_ty8qsvf9cj7ny.",
+  "name": "SonicScholar.ScreenShifter",
+  "publisher": "CN=D71FD640-E1DD-4E40-84DA-88C7D66E2260",
+  "publisher_display": "Sonic Scholar",
   "display_name": "Screen Shifter"
 }
