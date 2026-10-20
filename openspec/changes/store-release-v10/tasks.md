@@ -5,15 +5,15 @@
 
 ## 1. Package
 
-- [ ] 1.1 `packaging/AppxManifest.xml`: `{{DISPLAY_NAME}}` in Properties, VisualElements and the startup task; startup task `Enabled="false"`; `MaxVersionTested="10.0.26200.0"`
-- [ ] 1.2 `packaging/store.json` with placeholders; `tools/package.py --store` per design §1 (reads it, refuses placeholders and `--sign`, revision 0, `-store.msix` output); dev default display name "screen-shifter (dev)"
+- [ ] 1.1 `packaging/AppxManifest.xml`: `{{DISPLAY_NAME}}` in Properties, VisualElements and the startup task; startup task `Enabled="false"`; `MaxVersionTested="10.0.26200.0"`; the template header comment (lists every placeholder) and the startup task comment
+- [ ] 1.2 `packaging/store.json` with placeholders; `tools/package.py --store` per design §1 (reads it; refuses placeholders, a nonzero `--revision` and explicit identity flags; the uploaded `-store.msix` is never signed; with `--sign` also writes the kit-only `-store-kit.msix`); `tools/dev_cert.ps1 -Subject`; dev default display name "screen-shifter (dev)"; docstring updated
 - [ ] 1.3 Build both packages; check the Store manifest's identity and names
 
 ## 2. Start with Windows asks first
 
-- [ ] 2.1 `src/main.rs`: one modal helper used by the tray menu and both questions (`anim::clear_all`, `MODAL`, then the box or menu); a posted `WM_APP + n` (no clash with `WM_TRAY` or `hooks::WM_*`) after startup finishes asks the touchpad question (moved off the inline startup path) and then the startup question, never nested
+- [ ] 2.1 `src/main.rs`: one modal helper used by the tray menu and both questions (`anim::clear_all`, `MODAL.replace(true)` saved and restored, foreground first); `ASKING` makes `WM_TRAY` ignored while a question is up; `SHUTTING_DOWN` set at the start of `shutdown`, checked after each box (answer ignored, nothing recorded or applied, no next question); a posted `WM_APP + n` (no clash with `WM_TRAY` or `hooks::WM_*`) after startup finishes asks the touchpad question (moved off the inline startup path) and then the startup question, never nested
 - [ ] 2.2 Startup question per design §2: only for an installed package whose task is `Disabled` with no record; Yes → `RequestEnableAsync`; record `asked=yes|no` only on a real answer, `asked=skipped` for `Enabled`/`DisabledByUser`/policy states, nothing if the state can't be read; nothing after `shutdown`
-- [ ] 2.3 Touchpad question: record only on a real answer (same fix)
+- [ ] 2.3 Touchpad question moved to the posted path (design §2: registration, `put_back` and an already-given consent stay inline; Yes → `set_enabled(true)`); record only on a real answer and never after shutdown
 - [ ] 2.4 The record's parse/format as a pure tested function
 - [ ] 2.5 User-facing name "Screen Shifter" in the tray tooltip, message box titles and both questions
 
@@ -26,6 +26,6 @@
 ## 4. Verify and finish
 
 - [ ] 4.1 `cargo test` and `cargo clippy --all-targets -- -D warnings` clean
-- [ ] 4.2 Owner runs the Windows App Certification Kit on the Store package (admin terminal); failures fixed here
-- [ ] 4.3 Owner manual test: fresh install of the sideload package asks once (after the touchpad question if that one is due), Yes and No paths; upgrade test: v0.9 installed with start-at-sign-in on, install this version over it, not asked, still starts after signing out and in; Ctrl+Alt while a question is up doesn't freeze anything
+- [ ] 4.2 Owner makes and trusts the Store-publisher certificate, runs the Windows App Certification Kit on `-store-kit.msix` (admin terminal); failures fixed here
+- [ ] 4.3 Owner manual test: fresh install of the sideload package asks once (after the touchpad question if that one is due), Yes and No paths; upgrade test: v0.9 installed with start-at-sign-in on, install this version over it, not asked, still starts after signing out and in; Ctrl+Alt while a question is up doesn't freeze anything; right-clicking the tray icon while a question is up does nothing; signing out with a question up leaves the touchpad setting as it was
 - [ ] 4.4 Owner: screenshots, age rating questionnaire, listing pasted, submission (agents never submit); certification feedback goes into this change
