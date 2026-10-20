@@ -30,11 +30,15 @@ The installed app SHALL offer to start when the user signs in, and SHALL NOT ena
 ## ADDED Requirements
 
 ### Requirement: A Store build
-The packaging command SHALL also build an unsigned package for Microsoft Store submission, with the package name, publisher, publisher display name and display name reserved in Partner Center (kept in `packaging/store.json`) and version `a.b.c.0`. It SHALL refuse to build while those values are placeholders and SHALL NOT sign it. The display name SHALL come from the build's identity in every place the manifest shows a name, so the Store build is "Screen Shifter" and the sideload build is distinguishable from it.
+The packaging command SHALL also build an unsigned package for Microsoft Store submission, with the package name, publisher, publisher display name and display name reserved in Partner Center (kept in `packaging/store.json`) and version `a.b.c.0`. It SHALL refuse to build while those values are placeholders, and the package for upload SHALL be unsigned; a signed copy, only for running the certification kit locally, MAY also be written. The display name SHALL come from the build's identity in every place the manifest shows a name, so the Store build is "Screen Shifter" and the sideload build is distinguishable from it.
 
 #### Scenario: Store package
 - **WHEN** `packaging/store.json` holds the reserved identity and the developer runs the Store build with `Cargo.toml` at 0.10.0
 - **THEN** `dist/` contains an unsigned Store MSIX at 0.10.0.0 with that identity and the display name "Screen Shifter"
+
+#### Scenario: Copy for the certification kit
+- **WHEN** the developer runs the Store build with a signing certificate
+- **THEN** `dist/` contains the unsigned package for upload and, separately named, a signed copy for the certification kit
 
 #### Scenario: Not reserved yet
 - **WHEN** `packaging/store.json` still holds placeholders
