@@ -26,6 +26,6 @@
 ## 4. Verify and finish
 
 - [x] 4.1 `cargo test` and `cargo clippy --all-targets -- -D warnings` clean
-- [ ] 4.2 Owner makes and trusts the Store-publisher certificate, runs the Windows App Certification Kit on `-store-kit.msix` (admin terminal); failures fixed here
+- [x] 4.2 Owner makes and trusts the Store-publisher certificate, runs the Windows App Certification Kit on `-store-kit.msix` (admin terminal); failures fixed here
 - [ ] 4.3 Owner manual test: fresh install of the sideload package asks once (after the touchpad question if that one is due), Yes and No paths; upgrade test: v0.9 installed with start-at-sign-in on, install this version over it, not asked, still starts after signing out and in; Ctrl+Alt while a question is up doesn't freeze anything; right-clicking the tray icon while a question is up does nothing; signing out with a question up leaves the touchpad setting as it was
 - [ ] 4.4 Owner: screenshots, age rating questionnaire, listing pasted, submission (agents never submit); certification feedback goes into this change
