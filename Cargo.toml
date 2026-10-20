@@ -8,6 +8,8 @@ license = "MIT"
 version = "0.62.2"
 features = [
     "ApplicationModel",
+    "Foundation",
+    "System",
     "Win32_Foundation",
     "Win32_Graphics_Direct3D",
     "Win32_Graphics_Direct3D11",

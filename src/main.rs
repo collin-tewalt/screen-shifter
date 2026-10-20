@@ -1491,9 +1491,12 @@ fn toggle_startup(task: &StartupTask) {
             let _ = task.RequestEnableAsync().and_then(|op| op.join());
         }
         // Windows won't let an app re-enable what the user turned off: send them there.
-        Ok(StartupTaskState::DisabledByUser) => unsafe {
-            ShellExecuteW(None, w!("open"), w!("ms-settings:startupapps"), None, None, SW_SHOWNORMAL);
-        },
+        // (the WinRT launcher: the Store's certification kit flags ShellExecute in packaged apps)
+        Ok(StartupTaskState::DisabledByUser) => {
+            if let Ok(uri) = windows::Foundation::Uri::CreateUri(&windows::core::HSTRING::from("ms-settings:startupapps")) {
+                let _ = windows::System::Launcher::LaunchUriAsync(&uri);
+            }
+        }
         _ => {}
     }
 }
