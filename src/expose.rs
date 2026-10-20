@@ -38,8 +38,9 @@ const ICON_RANGE: (f32, f32) = (32.0, 72.0);
 const ICON_MIN_CELL: f32 = 120.0;
 /// Icon pictures kept on the GPU (apps, not windows).
 const ICON_SURFACES: usize = 64;
-/// The close badge on each preview: (diameter, inset from the corner) at 100%.
-const BADGE: (f32, f32) = (24.0, 8.0);
+/// The close badge's diameter at 100%. It straddles the preview's top-right corner (clear of
+/// the window's own close button); the margin and the gap between previews leave room for it.
+const BADGE: f32 = 32.0;
 /// A preview whose window was asked to close.
 const DIMMED: f32 = 0.4;
 const MARGIN: f32 = 48.0;
@@ -375,9 +376,7 @@ fn add_badge(tx: &Tx, pics: &(Pic, Pic), set: &mut Set, i: usize, size: i32) -> 
     if p.badge.is_some() || p.gone {
         return Ok(());
     }
-    let s = size as f32;
-    let inset = BADGE.1 * set.scale;
-    let rect = Rect { x: p.cell.x + p.cell.w - inset - s, y: p.cell.y + inset, w: s, h: s };
+    let rect = badge_place(p.cell, size as f32);
     unsafe {
         let visual = tx.dcomp.CreateVisual()?;
         visual.SetContent(&pics.0.0)?;
@@ -391,6 +390,11 @@ fn add_badge(tx: &Tx, pics: &(Pic, Pic), set: &mut Set, i: usize, size: i32) -> 
         set.previews[i].badge = Some(Badge { visual, fx, rect, size });
     }
     Ok(())
+}
+
+/// Where a preview's close badge of `size` pixels goes: centered on the preview's top-right corner.
+fn badge_place(cell: Rect, size: f32) -> Rect {
+    Rect { x: cell.x + cell.w - size / 2.0, y: cell.y - size / 2.0, w: size, h: size }
 }
 
 /// Back to the normal picture on whichever badge was hot.
@@ -604,7 +608,7 @@ fn open_in(g: &mut Gpu, monitor: &str, slot: usize, current: bool, roots: &[(Ent
         // Icons already known fade in once the spread has settled.
         let k = g.expose.open.len() - 1;
         let itx = Tx::after(g, if motion { ICON_FADE_MS } else { 0 }, if motion { OPEN_MS } else { 0 })?;
-        let size = (BADGE.0 * scale).round() as i32;
+        let size = (BADGE * scale).round() as i32;
         let pics = badge_pics(g, size)?;
         for i in 0..g.expose.open[k].previews.len() {
             add_icon(&itx, &g.expose.icon_surfaces, &g.expose.icon_keys, &mut g.expose.open[k], i)?;
@@ -1187,6 +1191,14 @@ pub fn drag_end(land: Land, motion: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn badge_straddles_the_corner_and_fits_the_margins() {
+        let cell = Rect { x: 100.0, y: 80.0, w: 400.0, h: 300.0 };
+        let b = badge_place(cell, BADGE);
+        assert_eq!((b.x + b.w / 2.0, b.y + b.h / 2.0), (500.0, 80.0), "centered on the top-right corner");
+        const { assert!(BADGE / 2.0 <= MARGIN && BADGE / 2.0 <= GAP, "half a badge fits the margin and the gap") };
+    }
 
     #[test]
     fn badge_is_a_disc_with_a_cross() {
