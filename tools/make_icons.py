@@ -20,6 +20,7 @@ SHADOW = (0x00, 0x5A, 0x9E)
 SHEET = (0xE5, 0xE7, 0xEB)
 BAR = (0x9C, 0xA3, 0xAF)
 BAR2 = (0xB8, 0xBE, 0xC7)
+STORE_BG = (0x11, 0x18, 0x27)  # Store art backdrop: near-black slate, the panel's dark
 
 # (x, y, w, h, radius, color) on a 128-unit canvas, painted in order.
 # "Sheet breaks out": the previous screen slides out past the monitor's left edge.
@@ -74,28 +75,31 @@ def coverage(px, py, x0, y0, x1, y1, r):
     return ox * oy
 
 
-def render(shapes, size, scale=1.0):
-    """RGBA bytes; the 128-unit design scaled by `scale` and centered."""
-    k = size / 128 * scale
-    off = size * (1 - scale) / 2
-    px = [[0.0, 0.0, 0.0, 0.0] for _ in range(size * size)]  # premultiplied
-    for x, y, w, h, r, (cr, cg, cb) in shapes:
-        x0, y0 = x * k + off, y * k + off
-        x1, y1, rr = x0 + w * k, y0 + h * k, r * k
-        for py in range(max(0, int(y0)), min(size, int(y1) + 1)):
-            for qx in range(max(0, int(x0)), min(size, int(x1) + 1)):
+def render(shapes, size, scale=1.0, height=None, bg=None):
+    """RGBA bytes; the 128-unit design scaled by `scale` of the shorter side and centered on a
+    `size` x `height` canvas, transparent or on an opaque `bg`."""
+    w, h = size, height or size
+    k = min(w, h) / 128 * scale
+    offx, offy = (w - 128 * k) / 2, (h - 128 * k) / 2
+    base = [c / 255 for c in bg] + [1.0] if bg else [0.0, 0.0, 0.0, 0.0]
+    px = [list(base) for _ in range(w * h)]  # premultiplied
+    for x, y, sw, sh, r, (cr, cg, cb) in shapes:
+        x0, y0 = x * k + offx, y * k + offy
+        x1, y1, rr = x0 + sw * k, y0 + sh * k, r * k
+        for py in range(max(0, int(y0)), min(h, int(y1) + 1)):
+            for qx in range(max(0, int(x0)), min(w, int(x1) + 1)):
                 a = coverage(qx, py, x0, y0, x1, y1, rr)
                 if a <= 0:
                     continue
-                p = px[py * size + qx]
+                p = px[py * w + qx]
                 p[0] = cr / 255 * a + p[0] * (1 - a)
                 p[1] = cg / 255 * a + p[1] * (1 - a)
                 p[2] = cb / 255 * a + p[2] * (1 - a)
                 p[3] = a + p[3] * (1 - a)
     out = bytearray()
-    for y in range(size):
+    for y in range(h):
         out.append(0)  # PNG filter: none
-        for r, g, b, a in px[y * size:(y + 1) * size]:
+        for r, g, b, a in px[y * w:(y + 1) * w]:
             if a > 0:
                 out += bytes((round(r / a * 255), round(g / a * 255), round(b / a * 255), round(a * 255)))
             else:
@@ -103,19 +107,19 @@ def render(shapes, size, scale=1.0):
     return bytes(out)
 
 
-def png(size, rows):
+def png(size, rows, height=None):
     def chunk(kind, data):
         return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data))
-    ihdr = struct.pack(">IIBBBBB", size, size, 8, 6, 0, 0, 0)
+    ihdr = struct.pack(">IIBBBBB", size, height or size, 8, 6, 0, 0, 0)
     return b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", ihdr) + chunk(b"IDAT", zlib.compress(rows, 9)) + chunk(b"IEND", b"")
 
 
-def write(path, size, shapes=None, scale=1.0):
+def write(path, size, shapes=None, scale=1.0, height=None, bg=None):
     shapes = shapes or (SIMPLE if size <= 24 else FULL)
     full = os.path.join(ROOT, path)
     os.makedirs(os.path.dirname(full), exist_ok=True)
     with open(full, "wb") as f:
-        f.write(png(size, render(shapes, size, scale)))
+        f.write(png(size, render(shapes, size, scale, height, bg), height))
     print(path)
 
 
@@ -131,6 +135,11 @@ def main():
     write(f"{a}/StoreLogo.png", 50)
     for s in (16, 20, 24, 32):
         write(f"assets/tray-{s}.png", s)
+    # Partner Center's optional Store art: opaque, the icon centered
+    st = "packaging/store/art"
+    write(f"{st}/box-1080.png", 1080, scale=0.6, bg=STORE_BG)
+    write(f"{st}/poster-1440x2160.png", 1440, scale=0.6, height=2160, bg=STORE_BG)
+    write(f"{st}/tile-300.png", 300, scale=0.75, bg=STORE_BG)
 
 
 if __name__ == "__main__":
