@@ -50,7 +50,7 @@ If the user chooses Exit while the UAC prompt is still up and then approves it, 
 
 ### 3. Always run as administrator
 
-A tray check item **Always run as administrator**, recorded in `elevate.txt` in the state directory (`always=yes|no`; parse/format a pure tested function). When on and the app starts unelevated (including from the startup task at sign-in), it posts the relaunch to itself once startup has finished, through the same path and the same modal treatment as the one-time questions (`WM_ASK` flow, after them): UAC appears; declining keeps it unelevated for this session (an in-memory `DECLINED` flag, so neither a re-posted `WM_ASK` nor anything else prompts again). Turning it on while unelevated also offers the relaunch immediately. The relaunch prompt and the stranded question run after the one-time questions even if one of those was dismissed without an answer (only `SHUTTING_DOWN` stops the sequence). When it is on, the stranded-windows question (§4) is not asked separately: the relaunch prompt comes anyway and the elevated copy restores them. A package update restarts the app unelevated (`RegisterApplicationRestart`), which re-prompts when "always" is on; accepted.
+A tray check item **Always run as administrator**, recorded in `elevate.txt` in the state directory (`always=yes|no`; parse/format a pure tested function). When on and the app starts unelevated (including from the startup task at sign-in), it posts the relaunch to itself once startup has finished, through the same path and the same modal treatment as the one-time questions (`WM_ASK` flow, after them): UAC appears; declining keeps it unelevated for this session (an in-memory `DECLINED` flag, so no automatic prompt comes again that session; the user choosing **Run as administrator** or turning "always" on again still prompts, since they asked). Turning it on while unelevated also offers the relaunch immediately. The relaunch prompt and the stranded question run after the one-time questions even if one of those was dismissed without an answer (only `SHUTTING_DOWN` stops the sequence). When it is on, the stranded-windows question (§4) is not asked separately: the relaunch prompt comes anyway and the elevated copy restores them. A package update restarts the app unelevated (`RegisterApplicationRestart`), which re-prompts when "always" is on; accepted.
 
 ### 4. Stranded admin windows
 
@@ -76,7 +76,7 @@ While elevated, the tray tooltip is "Screen Shifter (administrator)" and the tra
 
 ## Risks / Trade-offs
 
-- **Older Windows versions** might refuse to elevate a packaged app without `allowElevation` (only Windows 11 26200 was tested): `ShellExecuteExW` then fails and nothing changes; if that turns up, adding the capability is the fallback.
+- **Older Windows versions** (the manifest allows Windows 10 2004 and up) might refuse to elevate a packaged app without `allowElevation` (only Windows 11 26200 was tested): `ShellExecuteExW` then fails and nothing changes; if that turns up, adding the capability is the fallback.
 - **Elevated means a bigger blast radius:** global hooks and window control at admin level. Mitigation: nothing new is added beyond running the same code elevated; elevation is always the user's choice.
 - **The flash on relaunch.** Accepted; a seamless hand-off can come later.
 - **Stranded admin windows after a crash** need the user's Yes to come back (§4).
