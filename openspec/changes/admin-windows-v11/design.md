@@ -6,7 +6,7 @@ The app is one process, single-instance by a `Local\screen-shifter` mutex create
 
 **Goals:** admin apps' windows behave like any other while the app runs elevated; elevation only ever by the user's request through UAC; the "never left hidden" rule kept, including after an elevated run dies.
 
-**Non-Goals:** an elevated helper process (rejected: it would duplicate hooks, show/hide, placement and snapshots across two processes with a privileged channel to secure); `uiAccess` (not possible for MSIX: it requires Program Files or System32); elevating without a prompt (scheduled tasks); a seamless hand-off without the flash (later, if wanted); elevation as a different user (over-the-shoulder credentials: that copy has its own state folder; documented, not handled).
+**Non-Goals:** an elevated helper process (rejected: it would duplicate hooks, show/hide, placement and snapshots across two processes with a privileged channel to secure); `uiAccess` (not possible for MSIX: it requires Program Files or System32); elevating without a prompt (scheduled tasks); a seamless hand-off without the flash (later, if wanted). Elevation as a different user is not offered at all (§5): only an administrator in Admin Approval Mode gets the items, so the elevated copy is always the same user with the same state folder.
 
 ## Decisions
 
@@ -14,37 +14,48 @@ The app is one process, single-instance by a `Local\screen-shifter` mutex create
 
 Before anything else, a throwaway spike on the owner's machine, with test windows only of processes it launched itself (AGENTS.md):
 1. With the app unelevated, do the hooks see Ctrl+Alt while an admin window has focus? (Expected no; confirms the motivation.)
-2. How a packaged full-trust app relaunches itself elevated *with its package identity*: `ShellExecuteExW` `runas` on the installed exe path (identity likely lost), on an app execution alias (`uap5:AppExecutionAlias`), or on `shell:AppsFolder\<PFN>!ScreenShifter`; with and without `allowElevation`. The chosen route goes into §2.
-3. What the startup task does with that exe at sign-in (it must still launch unelevated: the exe stays `asInvoker`).
-4. From an unelevated process: can it tell that a window belongs to an elevated process (`OpenProcess` with limited query, `OpenProcessToken`/`TokenElevation`; access denied counted as elevated)?
-5. `CreateMutexW` on a mutex created by an elevated copy, from an unelevated one: `ERROR_ALREADY_EXISTS` or `ERROR_ACCESS_DENIED`?
+2. How a packaged full-trust app relaunches itself elevated *with its package identity*: `ShellExecuteExW` `runas` on the installed exe path (identity likely lost), on an app execution alias (`uap5:AppExecutionAlias`), or on `shell:AppsFolder\<PFN>!ScreenShifter`; with and without `allowElevation`. For the chosen route also: the command-line arguments (`--takeover <pid>`) arrive intact, and `ShellExecuteExW` with `SEE_MASK_NOCLOSEPROCESS` returns TRUE with a real process handle only once the elevated process exists.
+3. **Same state.** The elevated copy resolves `win::state_dir()` to the same physical folder as the unelevated one (package identity kept, the same MSIX app-data redirection), and each copy can replace (write-to-temp-and-rename) files the other created (owner and ACL of files written elevated). The hand-off depends on this.
+4. What the startup task does with the capability declared (it must still launch unelevated: the exe stays `asInvoker`), and that the `StartupTask` API works from an elevated process.
+5. From an unelevated process: the integrity level of a window's process (`OpenProcess` limited query, `OpenProcessToken`, `TokenIntegrityLevel`; what an access denial means).
+6. `CreateMutexW` from an unelevated copy on the mutex an elevated copy created: the error returned (windows-rs returns it as `Err`).
+7. While elevated: is the registered `TaskbarCreated` message (Explorer restart) and the tray callback delivered, and does `ChangeWindowMessageFilterEx(..., MSGFLT_ALLOW)` fix it?
 
-The spike's findings are written into this design before implementation.
+The spike's findings are written into this design before implementation (a short review round if they change it).
 
 ### 1. Single instance across elevation
 
-An object created by a high-integrity process gets a high mandatory label, so an unelevated `CreateMutexW` on it may fail with `ERROR_ACCESS_DENIED` instead of `ERROR_ALREADY_EXISTS`. Both mean "already running": the second copy exits without touching anything. (Confirmed by spike item 5.)
+An unelevated `CreateMutexW` on the mutex an elevated copy created may fail with `ERROR_ACCESS_DENIED` instead of `ERROR_ALREADY_EXISTS` (the elevated token's default DACL grants only Administrators and SYSTEM). Both mean "already running": the second copy exits without touching anything. windows-rs returns the failure as `Err`, so the code is checked there, not with a later `GetLastError`. (Spike item 6.) A third copy started in the instant between the old copy's exit and the new copy's lock wins, and the elevated copy exits; nothing is hidden at that moment, so nothing is stranded.
 
 ### 2. The relaunch (user-initiated)
 
-Tray **Run as administrator** (shown only when not elevated and the package can elevate) calls `ShellExecuteExW` with the `runas` verb on the route from spike item 2, passing `--takeover <pid>`. UAC asks the user:
-- **Declined or failed** (`ERROR_CANCELLED` or any error): nothing happens; the app keeps running unelevated.
-- **Approved:** the unelevated copy runs its normal Exit path (`show_all`, then `shutdown`: every window shown, state file kept). The elevated copy, started with `--takeover <pid>`, first waits for that process to exit (`OpenProcess(SYNCHRONIZE)`, at most 10 s), then starts normally: takes the lock, adopts the saved layout (hiding the slots' windows again, now including admin ones). The flash of all windows is accepted for now (non-goal: seamless).
+Tray **Run as administrator** (shown only when not elevated and elevation is offered, §5) calls `ShellExecuteExW` with the `runas` verb and `SEE_MASK_NOCLOSEPROCESS` on the route from spike item 2, passing `--takeover <pid>`. The call goes through the `modal()` helper with a re-entrancy guard (like `ASKING`), since the UAC prompt can pump messages: no nested tray menu, second relaunch or switch animation while it is up. Then:
+- **Declined or failed** (`FALSE`, `ERROR_CANCELLED`, or no process handle): nothing happens; the app keeps running unelevated.
+- **Approved** (`TRUE` with a real process handle): the unelevated copy runs its normal Exit path (`show_all`, then `shutdown`: every window shown, the state file kept).
+- **The new copy**, started with `--takeover <pid>`, waits for that process to exit (`OpenProcess(SYNCHRONIZE)`, at most 10 s) as the very first thing in `main`, before the panic hook and before `CreateMutexW`. If the wait times out, it logs and exits without touching anything (the old copy is still running and in charge). Then it starts normally: takes the lock and adopts the saved layout, hiding the slots' windows again, now including admin ones. The flash of all windows is accepted for now.
 - If the elevated copy fails to start after the old one exited, every window is already shown: nothing is stranded. If it panics after adopting, its panic hook shows from the state file, and as an elevated process it can show admin windows too.
 
 The `runas` call reintroduces `ShellExecuteExW`, which the certification kit flags in its optional "blocked executables" test (overall WARNING, not FAIL); accepted.
 
 ### 3. Always run as administrator
 
-A tray check item **Always run as administrator**, recorded in `elevate.txt` in the state directory (`always=yes|no`; parse/format a pure tested function). When on and the app starts unelevated (including from the startup task at sign-in), it posts the relaunch to itself once startup has finished, through the same path and the same modal treatment as the one-time questions (`WM_ASK` flow, after them): UAC appears; declining keeps it unelevated for this session (no repeated prompts). Turning it on while unelevated also offers the relaunch immediately.
+A tray check item **Always run as administrator**, recorded in `elevate.txt` in the state directory (`always=yes|no`; parse/format a pure tested function). When on and the app starts unelevated (including from the startup task at sign-in), it posts the relaunch to itself once startup has finished, through the same path and the same modal treatment as the one-time questions (`WM_ASK` flow, after them): UAC appears; declining keeps it unelevated for this session (no repeated prompts). Turning it on while unelevated also offers the relaunch immediately. When it is on, the stranded-windows question (§4) is not asked separately: the relaunch prompt comes anyway and the elevated copy restores them. A package update restarts the app unelevated (`RegisterApplicationRestart`), which re-prompts when "always" is on; accepted.
 
 ### 4. Stranded admin windows
 
-An elevated run can hide admin windows that an unelevated run can't show. Every normal exit path shows them (the app is elevated at that point). After a crash, kill or power loss, though, the next start is usually unelevated. During `adopt_saved_layout`, saved entries whose process is elevated (spike item 4) while this process is not are collected; if any, after startup the app asks: "Some windows of apps running as administrator are hidden, and Screen Shifter needs to run as administrator to show them. Run as administrator now?" Yes → the relaunch (§2), whose elevated copy restores them through adoption; No → asked again at the next start, and they stay recorded in the state file (never dropped). Until then they can't be shown: this is the one case the rule can't cover without the user's approval, and it is documented.
+**Which windows count.** Today a window the app couldn't hide (an admin window while unelevated) still gets recorded in a hidden slot, though it stays visible. So "elevated process" alone would flag windows that aren't stranded at all. A saved entry is *stranded* only when its window still exists and is the same app (`check`), its process has a higher integrity level than this process (spike item 5; not just "elevated or access denied", so SYSTEM or protected windows that elevation can't help with don't count), **and** it is not visible (`!IsWindowVisible`). A visible admin window is simply on screen: it goes to the show list like any other (where showing it is a no-op).
 
-### 5. Packaging and the build flag
+**Kept, never dropped.** Stranded entries are kept out of `State`'s slots: in core, `adopt` routes them into a separate stranded list (never to `show`), and `serialize` always writes that list back unchanged, also through `clear_state` (Restore all) and the monitor-set reset, until an elevated run adopts them (an elevated run's `adopt` treats them as ordinary saved entries). Core tests cover the routing and that every write keeps them. This way no switch, Restore all, display change or missing monitor erases them.
 
-`packaging/AppxManifest.xml` gains `{{ELEVATION_CAPABILITY}}`, which `tools/package.py` fills with `<rescap:Capability Name="allowElevation" />` unless `--no-elevation`. The exe's embedded manifest stays `asInvoker` (no `requestedExecutionLevel` change). At runtime the app decides whether elevation is possible: a development build (no package) always can (plain `runas` on its exe); a packaged build reads its installed `AppxManifest.xml` (next to the exe) for `allowElevation`; when it can't, neither tray item is shown and the stranded-windows question isn't asked. `packaging/store/certification.md` gains the justification for `allowElevation`: elevation only on the user's explicit request through UAC, to manage windows of apps the user runs as administrator.
+**The question.** After startup (the `WM_ASK` flow, after the one-time questions), if any are stranded and elevation is offered (§5) and "always" is off: "Some windows of apps running as administrator are hidden, and Screen Shifter needs to run as administrator to show them. Run as administrator now?" Yes → the relaunch (§2); No → asked again at the next start. In a build that can't elevate they are logged (they can't be shown by it). This is the one case the rule can't cover without the user's approval; README documents it.
+
+### 5. Packaging, the build flag, and who gets offered elevation
+
+`packaging/AppxManifest.xml` gains `{{ELEVATION_CAPABILITY}}`, which `tools/package.py` always replaces: with `<rescap:Capability Name="allowElevation" />`, or with an empty string under `--no-elevation` (the template header comment lists it). The exe's embedded manifest stays `asInvoker`.
+
+Elevation is offered (both tray items, the "always" relaunch, the stranded question) only when all hold: this process isn't elevated; the user is an administrator running in Admin Approval Mode (`TokenElevationType` is `TokenElevationTypeLimited`), so the elevated copy is the same user with the same state folder (a standard user would elevate as a different account with its own state, which could strand windows silently); and the build can elevate: a development build (no package) always can; a packaged build parses its installed `AppxManifest.xml` (next to the exe) for an actual `rescap:Capability` element named `allowElevation` (not a substring match). `packaging/store/certification.md` gains the `allowElevation` justification: elevation only on the user's explicit request through UAC, to manage windows of apps the user runs as administrator.
+
+**While elevated**, the app calls `ChangeWindowMessageFilterEx(app, TaskbarCreated, MSGFLT_ALLOW)` (and for the tray callback if spike item 7 shows it's filtered), so an Explorer restart doesn't leave it without a tray icon and an Exit.
 
 ### 6. Visible state
 
