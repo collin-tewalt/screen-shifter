@@ -1,7 +1,7 @@
 ## ADDED Requirements
 
 ### Requirement: Run as administrator only on the user's request
-When the app is not elevated, its build can elevate, and the user is an administrator (approving elevation as themselves), the tray menu SHALL offer "Run as administrator". Choosing it SHALL ask Windows (UAC) to start the app elevated. If the user approves, the app SHALL restart elevated, keeping every slot. If the user declines or elevation fails, nothing SHALL change. The app MUST NOT elevate in any other way than through a UAC prompt the user approves.
+When the app is not elevated and the user is an administrator (approving elevation as themselves), the tray menu SHALL offer "Run as administrator". Choosing it SHALL ask Windows (UAC) to start the app elevated. If the user approves, the app SHALL restart elevated, keeping every slot. If the user declines or elevation fails, nothing SHALL change. The app MUST NOT elevate in any other way than through a UAC prompt the user approves.
 
 #### Scenario: Approve
 - **WHEN** the user chooses "Run as administrator" and approves the UAC prompt
@@ -16,7 +16,7 @@ When the app is not elevated, its build can elevate, and the user is an administ
 - **THEN** the tray tooltip says it is running as administrator and "Run as administrator" isn't offered
 
 ### Requirement: Always run as administrator
-The tray menu SHALL offer "Always run as administrator", remembered across runs, to an administrator whose build can elevate, whether or not the app is elevated right now (so it can be turned off while elevated). When it is on and the app starts unelevated (including at sign-in), it SHALL ask through UAC once, after its own start, to restart elevated; declining SHALL keep it running unelevated for that session without asking again.
+The tray menu SHALL offer "Always run as administrator", remembered across runs, to an administrator, whether or not the app is elevated right now (so it can be turned off while elevated). When it is on and the app starts unelevated (including at sign-in), it SHALL ask through UAC once, after its own start, to restart elevated; declining SHALL keep it running unelevated for that session without asking again.
 
 #### Scenario: Turn it off while elevated
 - **WHEN** the app runs elevated and the user unchecks "Always run as administrator"
@@ -53,13 +53,6 @@ The administrator items, the "always" relaunch and the stranded question SHALL b
 
 #### Scenario: Standard user
 - **WHEN** a standard user runs the app
-- **THEN** the tray menu has no administrator items
-
-### Requirement: Builds that can't elevate
-A build that can't elevate (its package lacks the capability) SHALL offer neither tray item and SHALL NOT ask about stranded admin windows; admin apps' windows stay on screen as before.
-
-#### Scenario: Store build without the capability
-- **WHEN** the app is installed from a package built without elevation
 - **THEN** the tray menu has no administrator items
 
 ### Requirement: The tray works while elevated
