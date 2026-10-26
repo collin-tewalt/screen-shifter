@@ -12,7 +12,7 @@ How to try it:
 1. Launch Screen Shifter. It asks two one-time questions (a three-finger touchpad swipe, start when signing in); either answer is fine.
 2. Hold Ctrl+Alt for half a second: a panel appears at the bottom of each monitor.
 3. While holding Ctrl+Alt: scroll up to create and switch slots on the monitor under the mouse, click "+ New", click a slot tile to jump to it, rest the mouse on a tile to spread that slot's windows, drag a window or a preview onto a tile to move it. Release Ctrl+Alt to close the panel. Ctrl+Alt+← / → also switch.
-4. Right-click the tray icon: Restore all windows, Start with Windows, Three-finger swipe, Exit.
+4. Right-click the tray icon: Restore all windows, Start with Windows, Three-finger swipe, Run as administrator / Always run as administrator (shown to administrators), Exit.
 
 On user input and system changes:
 - The low-level keyboard hook (WH_KEYBOARD_LL) only tracks whether Ctrl and Alt are held (and Esc to close the panel). The low-level mouse hook (WH_MOUSE_LL) only acts while the panel is open (wheel, clicks and drags on the panel). Nothing is logged, stored or transmitted; all other input passes through untouched. The app makes no network connections.

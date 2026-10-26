@@ -12,8 +12,8 @@ Screen Shifter does not collect, store or transmit any personal information. It 
 
 In the app's own local data folder:
 
-- a small state file listing the windows it has hidden (window handle, process id, window class, and which slot), so that if the app or your PC stops unexpectedly, the next start can put them back. It is deleted by **Restore all windows** and is rewritten as you switch.
-- your answers to its two one-time questions (whether a three-finger swipe may open the panel, and whether to start when you sign in), and, while the swipe is on, the previous value of the Windows three-finger setting so it can be put back.
+- a small state file listing the windows it has hidden (window handle, process id, window class, and which slot), so that if the app or your PC stops unexpectedly, the next start can put them back. **Restore all windows** empties it (keeping only windows of apps running as administrator that it can't show yet), and it is rewritten as you switch.
+- your answers to its two one-time questions (whether a three-finger swipe may open the panel, and whether to start when you sign in), whether to always run as administrator, and, while the swipe is on, the previous value of the Windows three-finger setting so it can be put back.
 
 None of this leaves your device. Uninstalling Screen Shifter removes it all.
 
