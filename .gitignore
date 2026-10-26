@@ -3,3 +3,8 @@ dist/
 stage/
 *.pfx
 *.cer
+
+# elevation spike build output
+spikes/elevation/target/
+spikes/elevation/stage/
+spikes/elevation/*.msix
