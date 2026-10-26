@@ -5,7 +5,7 @@ Packages SHALL declare the `allowElevation` capability by default, and the packa
 
 #### Scenario: Default build
 - **WHEN** the developer builds a package without the flag
-- **THEN** its manifest declares `allowElevation` and the installed app offers "Run as administrator"
+- **THEN** its manifest declares `allowElevation` and the installed app offers "Run as administrator" to an administrator
 
 #### Scenario: Without elevation
 - **WHEN** the developer builds with the no-elevation flag

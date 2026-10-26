@@ -1,6 +1,6 @@
 ## 1. Spike (owner's machine, test windows only of processes the spike launched)
 
-- [ ] 1.1 Hooks unelevated vs an admin window with focus (Ctrl+Alt seen?)
+- [ ] 1.1 Hooks unelevated vs an admin window with focus (Ctrl+Alt seen?); elevated: snapshots (`PrintWindow`) and icons of admin windows work
 - [ ] 1.2 Relaunch elevated with package identity: `runas` on the exe path, an execution alias, `shell:AppsFolder\<PFN>!ScreenShifter`; with and without `allowElevation`; arguments arrive; `ShellExecuteExW` returns a real process handle; whether it blocks or pumps, and how the prompt appears when started from a background/startup-task launch
 - [ ] 1.3 The elevated copy resolves the same state folder and can replace files the unelevated copy wrote, and vice versa
 - [ ] 1.4 Startup task with the capability declared still launches unelevated; `StartupTask` API works when elevated
@@ -11,7 +11,7 @@
 
 ## 2. Core: stranded entries
 
-- [ ] 2.1 `core.rs`: a stranded list beside the slots; `adopt` takes a `stranded` predicate and applies it after `check` (Here and Elsewhere), before the active-slot/limit/monitor tests, only for the current boot; `serialize`, `restore_all` and `reset_if_monitors_changed` keep the list; `forget_dead` leaves it alone; an elevated run's adopt takes them back as ordinary entries; tests: active slot, gone monitor, other boot, Restore all round trip, an old slot index beyond the current count or equal to the active one
+- [ ] 2.1 `core.rs`: a stranded list beside the slots; `adopt` takes a `stranded` predicate and applies it after `check` (Here and Elsewhere), before the active-slot/limit/monitor tests, only for the current boot; `serialize`, `restore_all` and `reset_if_monitors_changed` keep the list; `forget_dead` leaves it alone; an elevated run's adopt takes them back as ordinary entries; serialized tagged with the monitor's active slot; `hidden()` excludes them; a switch or move that captures one drops it from the list; tests: active slot, gone monitor, other boot, Restore all round trip, stranded → serialize → parse → adopt with the predicate false → shown
 - [ ] 2.2 `main.rs`: Restore all and the monitor-set reset call `persist(&[])` instead of `win::clear_state()`; remove `clear_state`
 
 ## 2b. Elevation in the app
@@ -19,9 +19,9 @@
 - [ ] 2b.1 `win.rs`: this process is elevated; elevation type (`Limited`/`Full` = an administrator elevating as themselves); stranded = same boot, exists, same app, process exactly High while we're Medium (fallback per spike 1.5), not visible
 - [ ] 2b.2 Single instance: `ERROR_ACCESS_DENIED` (as the `Err` from `CreateMutexW`) also means already running
 - [ ] 2b.3 Design §5: items available (administrator elevating as themselves, build can elevate: dev yes; packaged: a real `allowElevation` capability element in the installed manifest) vs relaunch requestable (also not elevated)
-- [ ] 2b.4 Relaunch per design §2: `ShellExecuteExW` `runas` on a worker thread posting the result; `RELAUNCHING` flag; result ignored after `SHUTTING_DOWN`; `--takeover <pid>`; exit only on TRUE with a process handle; the new copy waits for the old pid before the panic hook and the mutex (≤ 10 s, else log and exit untouched)
+- [ ] 2b.4 Relaunch per design §2: `ShellExecuteExW` `runas` on a worker thread posting the result; `RELAUNCHING` flag; result ignored after `SHUTTING_DOWN`; COM initialized on the worker; `--takeover <pid>` (old process already gone → proceed); exit only on TRUE with a process handle; the new copy waits for the old pid before the panic hook and the mutex (≤ 10 s, else log and exit untouched)
 - [ ] 2b.5 Tray: "Run as administrator" (relaunch requestable), "Always run as administrator" check item (items available, elevated or not), tooltip "(administrator)" when elevated
-- [ ] 2b.6 "Always": `elevate.txt` record (pure tested parse/format); relaunch asked once after startup through the `WM_ASK` path, after the one-time questions; an in-memory `DECLINED` flag stops any re-prompt that session; turning it on offers the relaunch; with "always" on the stranded question isn't asked separately
+- [ ] 2b.6 "Always": `elevate.txt` record (pure tested parse/format); relaunch asked once after startup through the `WM_ASK` path, after the one-time questions (even if one was dismissed); an in-memory `DECLINED` flag stops any re-prompt that session; turning it on offers the relaunch; with "always" on the stranded question isn't asked separately
 - [ ] 2b.7 Stranded question per design §4 (only when elevation is offered and "always" is off; logged in builds that can't elevate)
 - [ ] 2b.8 While elevated: `ChangeWindowMessageFilterEx` for `TaskbarCreated` (and the tray callback per spike 1.7)
 

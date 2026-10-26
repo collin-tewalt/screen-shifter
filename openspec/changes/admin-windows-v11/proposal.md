@@ -8,7 +8,7 @@ Windows' UIPI keeps a normal process from controlling an elevated one, so Screen
 - **Always run as administrator** (a tray option, remembered): every later start, including the start at sign-in, comes up normally and immediately asks UAC to relaunch elevated; declining keeps it running unelevated, managing normal windows as today.
 - **One process.** The elevated copy is the whole app (one state, one set of hooks); an elevated process controls admin and normal windows alike. No elevated helper.
 - **Hand-off:** the relaunch uses the existing Exit and adopt-on-start path: the unelevated copy shows everything and exits, the elevated copy takes the saved layout back (a brief flash, but no new way to strand windows).
-- **Stranded admin windows.** If a start that isn't elevated finds windows of admin apps still hidden by an earlier elevated run that was ended without exiting (a crash, or ended from Task Manager), it asks to run as administrator to restore them, on every start until they are restored.
+- **Stranded admin windows.** If a start that isn't elevated finds windows of admin apps still hidden by an earlier elevated run that was ended without exiting (a crash the panic hook doesn't catch, or ended from Task Manager), it asks to run as administrator to restore them, on every start until they are restored.
 - **One copy at a time across elevation.** The single-instance check also holds when the running copy is elevated.
 - **Packaging.** The package declares the `allowElevation` restricted capability (the exe still runs as invoker, so it never elevates on its own); `tools/package.py --no-elevation` builds without it, and the app hides both tray items when its package can't elevate. The Store build tries with the capability first; the flag is the fallback if certification refuses it.
 - When elevated, the tray tooltip says "Screen Shifter (administrator)".
@@ -26,6 +26,7 @@ Windows' UIPI keeps a normal process from controlling an elevated one, so Screen
 ## Impact
 
 - `src/main.rs`: tray items, the relaunch (`ShellExecuteExW` with `runas`, which brings back the certification kit's optional "blocked executables" warning), the takeover wait, the "always" record, the startup question for stranded admin windows, the single-instance check.
+- `src/core.rs`: the stranded list, `adopt`'s stranded predicate, serialization.
 - `src/win.rs`: whether this process is elevated; whether a window belongs to an elevated process.
 - `packaging/AppxManifest.xml`, `tools/package.py`: the capability (template), `--no-elevation`, possibly an app execution alias (see the spike).
 - `packaging/store/certification.md`: the `allowElevation` justification.

@@ -34,7 +34,7 @@ A second copy SHALL exit without touching any window whether the running copy is
 - **THEN** the second copy exits and the elevated one keeps running
 
 ### Requirement: Admin windows are never stranded silently
-When an unelevated start finds windows of apps running as administrator that an earlier elevated run left hidden (still existing, not visible), the app SHALL ask to run as administrator to restore them, and SHALL ask again at every start until they are restored. They SHALL stay recorded until then, through every switch, Restore all, and display change. An admin window that stayed visible SHALL NOT count.
+When an unelevated start finds windows of apps running as administrator that an earlier elevated run left hidden (still existing, not visible), and elevation can be requested, the app SHALL ask to run as administrator to restore them, and SHALL ask again at every start until they are restored. They SHALL stay recorded until then, through every switch, Restore all, and display change. An admin window that stayed visible SHALL NOT count.
 
 #### Scenario: Admin window that stayed visible
 - **WHEN** an unelevated run switched away from a slot while an admin terminal stayed on screen, and the app starts again
@@ -42,7 +42,7 @@ When an unelevated start finds windows of apps running as administrator that an 
 
 #### Scenario: After the elevated app was ended
 - **WHEN** the elevated app hid an admin terminal, was then ended from Task Manager, and the user starts it again unelevated
-- **THEN** it asks to run as administrator; on Yes the terminal comes back
+- **THEN** it asks to run as administrator; on Yes the terminal is shown again
 
 #### Scenario: Restore all keeps them
 - **WHEN** admin windows are stranded and the user chooses Restore all in the unelevated app
