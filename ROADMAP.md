@@ -30,6 +30,7 @@ This file lives at the repo root. Open question: should non-goals be added to La
 ## Now
 
 - **Microsoft Store release** (`store-release-v10`): in certification.
+- **Manage windows of apps running as administrator** (`admin-windows-v11`): implemented, owner testing.
 
 ## Next
 

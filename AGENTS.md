@@ -27,7 +27,8 @@ Practical consequences:
 - Run Windows SDK tools (`makeappx`, `makepri`, `signtool`) from **PowerShell**: Git Bash rewrites `/flag` arguments into paths.
 - Package: `python tools/package.py` (stdlib only; version from `Cargo.toml`, `a.b.c` → `a.b.c.0`). Re-sideloading a newer build of the same version needs `--revision N`. `--store` builds the Store package (see "Store release").
 - Icons: `python tools/make_icons.py` regenerates every PNG (outputs are committed).
-- `SCREEN_SHIFTER_GDI=1` forces the non-GPU slide fallback. `SCREEN_SHIFTER_SCREENSHOTS=1` lets screen capture see the overlays (Store screenshots).
+- `SCREEN_SHIFTER_GDI=1` forces the non-GPU slide fallback.
+- Elevation (admin-windows-v11): the app relaunches itself with `runas` on its own exe path, passing `--takeover <pid>`; the new copy waits for the old one before taking the lock. Windows of admin apps that a dead elevated run left hidden are kept as *stranded* entries (core) until an elevated run shows them. `spikes/elevation` holds the throwaway spike that established the facts. `SCREEN_SHIFTER_SCREENSHOTS=1` lets screen capture see the overlays (Store screenshots).
 
 ## Sideloading on a new machine
 

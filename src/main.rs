@@ -19,14 +19,15 @@ use std::thread::JoinHandle;
 use std::cell::{Cell, RefCell};
 use std::sync::atomic::{AtomicU32, Ordering};
 use windows::Win32::Foundation::{
-    ERROR_ALREADY_EXISTS, GetLastError, HWND, LPARAM, LRESULT, POINT, RECT, WPARAM,
+    CloseHandle, ERROR_ACCESS_DENIED, ERROR_ALREADY_EXISTS, GetLastError, HWND, LPARAM, LRESULT, POINT, RECT, WAIT_OBJECT_0, WPARAM,
 };
+use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, COINIT_DISABLE_OLE1DDE, CoInitializeEx, CoUninitialize};
 use windows::Win32::Graphics::Dwm::DwmFlush;
 use windows::Win32::Graphics::Gdi::*;
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::ApplicationModel::{StartupTask, StartupTaskState};
 use windows::Win32::System::Recovery::{RESTART_NO_CRASH, RESTART_NO_HANG, RESTART_NO_REBOOT, RegisterApplicationRestart};
-use windows::Win32::System::Threading::CreateMutexW;
+use windows::Win32::System::Threading::{CreateMutexW, OpenProcess, PROCESS_SYNCHRONIZE, WaitForSingleObject};
 use windows::Win32::UI::HiDpi::{
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetSystemMetricsForDpi, SetProcessDpiAwarenessContext,
 };
@@ -41,10 +42,14 @@ const HK_PANIC: i32 = 3; // debug builds only: failure drill for task 6.3
 const WM_TRAY: u32 = WM_APP + 1;
 /// Posted once startup is done: the one-time questions (touchpad, start with Windows).
 const WM_ASK: u32 = WM_APP + 2;
+/// Posted by the elevation worker: wparam 1 = an elevated copy started, 0 = declined or failed.
+const WM_RELAUNCHED: u32 = WM_APP + 3;
 const CMD_RESTORE: i32 = 1;
 const CMD_EXIT: i32 = 2;
 const CMD_STARTUP: i32 = 3;
 const CMD_TOUCHPAD: i32 = 4;
+const CMD_ELEVATE: i32 = 5;
+const CMD_ALWAYS: i32 = 6;
 /// Must match the manifest's `desktop:StartupTask TaskId`.
 const STARTUP_TASK: &str = "ScreenShifter";
 /// Tray icon sizes we ship (`tools/make_icons.py`).
@@ -108,6 +113,11 @@ thread_local! {
     static ASK_PENDING: Cell<bool> = const { Cell::new(false) };
     /// `shutdown` has begun: a question that returns now is ignored.
     static SHUTTING_DOWN: Cell<bool> = const { Cell::new(false) };
+    /// A UAC prompt to relaunch elevated is pending (on its worker thread).
+    static RELAUNCHING: Cell<bool> = const { Cell::new(false) };
+    /// This session already asked to elevate by itself ("always", stranded windows): it doesn't
+    /// again, whatever the answer. The tray items still work: the user asked.
+    static AUTO_ELEVATE_ASKED: Cell<bool> = const { Cell::new(false) };
     static APP: Cell<HWND> = Cell::new(HWND::default());
     /// The tile the mouse is resting on, waiting for HOVER_TIMER.
     static HOVER_TILE: RefCell<Option<(String, usize)>> = const { RefCell::new(None) };
@@ -167,11 +177,25 @@ fn main() {
     }
     unsafe {
         let _ = SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
-        // Held for the life of the process; a second instance must not touch anything.
-        let _mutex = CreateMutexW(None, true, w!("Local\\screen-shifter"));
-        if GetLastError() == ERROR_ALREADY_EXISTS {
+        // Started elevated by the copy the user asked to run as administrator: that copy shows
+        // every window and exits; only then may this one take over (before touching anything).
+        if let Some(pid) = takeover_pid()
+            && !wait_for_exit(pid)
+        {
+            log!("takeover: the previous copy (pid {pid}) is still running; exiting untouched");
             return;
         }
+        // Held for the life of the process; a second instance must not touch anything, whether
+        // the running one is elevated or not.
+        let mutex = CreateMutexW(None, true, w!("Local\\screen-shifter"));
+        let running = match &mutex {
+            Ok(_) => GetLastError() == ERROR_ALREADY_EXISTS,
+            Err(e) => e.code() == ERROR_ACCESS_DENIED.to_hresult(),
+        };
+        if running {
+            return;
+        }
+        let _mutex = mutex;
 
         // The state file is written before anything is hidden, so it is always the
         // authoritative recovery source. Never touch STATE here: it may be borrowed.
@@ -302,7 +326,8 @@ unsafe fn tray(app: HWND, op: NOTIFY_ICON_MESSAGE) {
         hIcon: tray_icon(),
         ..Default::default()
     };
-    let tip: Vec<u16> = "Screen Shifter (Ctrl+Alt+\u{2190}/\u{2192})".encode_utf16().collect();
+    let name = if win::is_elevated() { "Screen Shifter (administrator)" } else { "Screen Shifter" };
+    let tip: Vec<u16> = format!("{name} (Ctrl+Alt+\u{2190}/\u{2192})").encode_utf16().collect();
     nid.szTip[..tip.len()].copy_from_slice(&tip);
     let _ = unsafe { Shell_NotifyIconW(op, &nid) };
 }
@@ -311,7 +336,10 @@ unsafe fn tray(app: HWND, op: NOTIFY_ICON_MESSAGE) {
 /// a switch: write-ahead (everything to show or hide is recorded), act, then the exact state.
 fn adopt_saved_layout() {
     let names = win::monitor_names();
-    let (state, show) = core::adopt(&win::read_layout(), win::boot_time(), &names, win::check);
+    let (state, show) = core::adopt(&win::read_layout(), win::boot_time(), &names, win::check, win::stranded);
+    if !state.stranded().is_empty() {
+        log!("startup: {} window(s) of admin apps are hidden and need an elevated run to come back", state.stranded().len());
+    }
     let adopted = state.hidden();
     win::write_state(&state, &show);
     let show: Vec<Entry> = show.into_iter().map(|(_, _, e)| e).collect();
@@ -1252,7 +1280,7 @@ fn show_all() {
 /// Shows everything and forgets the layout.
 fn restore_all() {
     show_all();
-    win::clear_state();
+    persist(&[]); // the slots are gone; windows of admin apps this run can't show stay recorded
 }
 
 fn show_osd(slot: usize, count: usize, monitor: RECT) {
@@ -1315,6 +1343,18 @@ unsafe extern "system" fn app_proc(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) ->
             WM_TRAY if ASKING.get() && matches!(lp.0 as u32, WM_LBUTTONUP | WM_RBUTTONUP | WM_CONTEXTMENU) => raise_question(),
             WM_TRAY if matches!(lp.0 as u32, WM_RBUTTONUP | WM_CONTEXTMENU) => tray_menu(h),
             WM_ASK => ask_questions(h),
+            WM_RELAUNCHED => {
+                RELAUNCHING.set(false);
+                if SHUTTING_DOWN.get() {
+                    // already exiting (everything shown): the elevated copy takes over, if it started
+                } else if wp.0 != 0 {
+                    log!("relaunched as administrator: handing over");
+                    show_all(); // the elevated copy waits for us, then takes the layout back
+                    shutdown(h);
+                } else {
+                    log!("run as administrator: declined or failed");
+                }
+            }
             hooks::WM_CHORD_DOWN => {
                 SetTimer(Some(h), PANEL_TIMER, PANEL_DELAY_MS, None);
             }
@@ -1433,7 +1473,7 @@ unsafe extern "system" fn app_proc(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) ->
                 if let Some(entries) = reset {
                     log!("monitor set changed: restoring {}", entries.len());
                     win::show(&entries);
-                    win::clear_state();
+                    persist(&[]);
                 }
                 if panel::is_shown() {
                     show_panels(); // rebuild for the new layout
@@ -1540,17 +1580,122 @@ fn ask_questions(app: HWND) {
         return;
     }
     ASKING.set(true);
-    let mut go_on = true;
-    if touchpad::needs_question() {
-        match ask(app, touchpad::QUESTION) {
-            Some(yes) => touchpad::set_enabled(yes),
-            None => go_on = false,
-        }
+    if touchpad::needs_question()
+        && let Some(yes) = ask(app, touchpad::QUESTION)
+    {
+        touchpad::set_enabled(yes);
     }
-    if go_on && startup_record().is_none() {
+    if !SHUTTING_DOWN.get() && startup_record().is_none() {
         ask_startup(app);
     }
+    if !SHUTTING_DOWN.get() {
+        ask_elevation(app);
+    }
     ASKING.set(false);
+}
+
+// ---------- run as administrator (only on the user's request, through UAC) ----------
+
+/// The administrator items are offered: the user elevates as themselves, so an elevated copy
+/// is the same user with the same state folder.
+fn elevation_offered() -> bool {
+    win::elevates_as_self()
+}
+
+/// A relaunch can be asked for: offered, and not already elevated.
+fn elevation_requestable() -> bool {
+    elevation_offered() && !win::is_elevated()
+}
+
+/// After startup: "always" relaunches; otherwise windows of admin apps left hidden by an
+/// earlier elevated run are mentioned. Once per session.
+fn ask_elevation(app: HWND) {
+    if !elevation_requestable() || AUTO_ELEVATE_ASKED.replace(true) {
+        return;
+    }
+    if always_elevate() {
+        request_elevation(app);
+        return;
+    }
+    if STATE.with(|s| s.borrow().stranded().is_empty()) {
+        return;
+    }
+    let text = w!("Some windows of apps running as administrator are hidden, and Screen Shifter needs to run as administrator to show them.\n\nRun as administrator now?");
+    if ask(app, text) == Some(true) {
+        request_elevation(app);
+    }
+}
+
+/// Asks Windows (UAC) to start this exe elevated, taking over from this copy. The call waits
+/// for the user while pumping messages, so it runs on a worker thread and posts the result.
+fn request_elevation(app: HWND) {
+    if RELAUNCHING.replace(true) {
+        return; // a prompt is already up
+    }
+    let Ok(exe) = std::env::current_exe() else {
+        RELAUNCHING.set(false);
+        return;
+    };
+    let (pid, app_raw) = (std::process::id(), app.0 as isize);
+    std::thread::spawn(move || unsafe {
+        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE);
+        let file = windows::core::HSTRING::from(exe.as_os_str());
+        let params = windows::core::HSTRING::from(format!("--takeover {pid}"));
+        let mut info = SHELLEXECUTEINFOW {
+            cbSize: size_of::<SHELLEXECUTEINFOW>() as u32,
+            fMask: SEE_MASK_NOCLOSEPROCESS,
+            lpVerb: w!("runas"),
+            lpFile: PCWSTR(file.as_ptr()),
+            lpParameters: PCWSTR(params.as_ptr()),
+            nShow: SW_SHOWNORMAL.0,
+            ..Default::default()
+        };
+        let started = ShellExecuteExW(&mut info).is_ok() && !info.hProcess.is_invalid();
+        if !info.hProcess.is_invalid() {
+            let _ = CloseHandle(info.hProcess);
+        }
+        let _ = PostMessageW(Some(HWND(app_raw as *mut _)), WM_RELAUNCHED, WPARAM(started as usize), LPARAM(0));
+        CoUninitialize();
+    });
+}
+
+/// `--takeover <pid>`: started elevated by that copy.
+fn takeover_pid() -> Option<u32> {
+    let args: Vec<String> = std::env::args().collect();
+    let i = args.iter().position(|a| a == "--takeover")?;
+    args.get(i + 1)?.parse().ok()
+}
+
+/// Waits (at most 10 s) for the copy that started us to exit. True if it's gone.
+fn wait_for_exit(pid: u32) -> bool {
+    unsafe {
+        let Ok(h) = OpenProcess(PROCESS_SYNCHRONIZE, false, pid) else { return true }; // already gone
+        let r = WaitForSingleObject(h, 10_000);
+        let _ = CloseHandle(h);
+        r == WAIT_OBJECT_0
+    }
+}
+
+fn parse_always(text: &str) -> bool {
+    text.lines().any(|l| l.trim() == "always=yes")
+}
+
+fn format_always(on: bool) -> &'static str {
+    if on { "always=yes\n" } else { "always=no\n" }
+}
+
+fn always_path() -> std::path::PathBuf {
+    win::state_dir().join("elevate.txt")
+}
+
+/// "Always run as administrator" is on.
+fn always_elevate() -> bool {
+    std::fs::read_to_string(always_path()).is_ok_and(|t| parse_always(&t))
+}
+
+fn set_always_elevate(on: bool) {
+    let _ = std::fs::create_dir_all(win::state_dir());
+    let _ = std::fs::write(always_path(), format_always(on));
 }
 
 /// Start with Windows, asked once on an installed package (store policy: consent first).
@@ -1636,6 +1781,15 @@ unsafe fn tray_menu(app: HWND) {
         let _ = AppendMenuW(menu, MF_STRING | flags, CMD_STARTUP as usize, label);
         let touchpad_flags = if touchpad::enabled() { MF_CHECKED } else { MF_UNCHECKED };
         let _ = AppendMenuW(menu, MF_STRING | touchpad_flags, CMD_TOUCHPAD as usize, w!("Three-finger swipe opens panel"));
+        if elevation_offered() {
+            let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
+            if !win::is_elevated() {
+                let pending = if RELAUNCHING.get() { MF_GRAYED } else { MF_ENABLED };
+                let _ = AppendMenuW(menu, MF_STRING | pending, CMD_ELEVATE as usize, w!("Run as administrator"));
+            }
+            let always = if always_elevate() { MF_CHECKED } else { MF_UNCHECKED };
+            let _ = AppendMenuW(menu, MF_STRING | always, CMD_ALWAYS as usize, w!("Always run as administrator"));
+        }
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, None);
         let _ = AppendMenuW(menu, MF_STRING, CMD_EXIT as usize, w!("Exit"));
         let mut pt = Default::default();
@@ -1654,12 +1808,32 @@ unsafe fn tray_menu(app: HWND) {
                 }
             }
             CMD_TOUCHPAD => touchpad::set_enabled(!touchpad::enabled()),
+            CMD_ELEVATE => request_elevation(app),
+            CMD_ALWAYS => {
+                let on = !always_elevate();
+                set_always_elevate(on);
+                if on && elevation_requestable() {
+                    request_elevation(app); // the user just asked for it
+                }
+            }
             CMD_EXIT => {
                 show_all(); // the next start takes them back
                 shutdown(app);
             }
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod elevate_tests {
+    use super::*;
+
+    #[test]
+    fn the_always_setting_round_trips() {
+        assert!(parse_always(format_always(true)));
+        assert!(!parse_always(format_always(false)));
+        assert!(!parse_always(""), "off unless chosen");
     }
 }
 

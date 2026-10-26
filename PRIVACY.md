@@ -19,7 +19,7 @@ None of this leaves your device. Uninstalling Screen Shifter removes it all.
 
 ## Changes it makes to Windows
 
-Only with your consent, and undone by the app: turning off Windows' own three-finger slide while the swipe feature is on (restored when the app exits), and starting when you sign in (you can turn it off from the tray icon or Settings → Apps → Startup).
+Only with your consent, and undone by the app: turning off Windows' own three-finger slide while the swipe feature is on (restored when the app exits), and starting when you sign in (you can turn it off from the tray icon or Settings → Apps → Startup). It runs as administrator only when you choose it from the tray icon and approve Windows' UAC prompt, to manage windows of apps you run as administrator; nothing else changes when it does.
 
 ## Contact
 

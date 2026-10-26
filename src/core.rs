@@ -101,6 +101,10 @@ impl Monitor {
 pub struct State {
     monitors: BTreeMap<String, Monitor>,
     monitor_set: Vec<String>,
+    /// Windows of admin apps an earlier elevated run left hidden, which this (unelevated) run
+    /// can neither show nor hide: never in a slot, never shown, never dropped, always written
+    /// back, until an elevated run takes them back. (monitor, window)
+    stranded: Vec<(String, Entry)>,
 }
 
 impl State {
@@ -140,6 +144,7 @@ impl State {
                 slot.retain(|e| !contains(&visible, e.id));
             }
         }
+        self.stranded.retain(|(_, e)| !contains(&visible, e.id)); // its app showed it again
 
         let m = self.monitors.get_mut(monitor).expect("inserted above");
         let plan = Plan {
@@ -175,6 +180,7 @@ impl State {
                 p.show.retain(|e| !contains(entries, e.id));
             }
         }
+        self.stranded.retain(|(_, e)| !contains(entries, e.id));
         let hide = slot != to_active;
         if hide {
             let slots = &mut self.monitors.get_mut(to).expect("inserted above").slots;
@@ -286,7 +292,13 @@ impl State {
             .collect()
     }
 
-    /// Forget all slots; returns everything that must be shown.
+    /// Admin windows this run can't show (see `stranded`).
+    pub fn stranded(&self) -> Vec<Entry> {
+        self.stranded.iter().map(|(_, e)| e.clone()).collect()
+    }
+
+    /// Forget all slots (stranded windows are kept: they can't be shown); returns everything
+    /// that must be shown.
     pub fn restore_all(&mut self) -> Vec<Entry> {
         let all = self.hidden();
         self.monitors.clear();
@@ -312,7 +324,10 @@ impl State {
         let recorded = self.monitors.iter().flat_map(|(name, m)| {
             m.slots.iter().enumerate().flat_map(move |(i, slot)| slot.iter().map(move |e| (name, i, e)))
         });
-        for (name, i, e) in recorded.chain(extra.iter().map(|(n, i, e)| (n, *i, e))) {
+        // Stranded windows go in their monitor's active slot: their old slot numbers belonged to
+        // the elevated run that hid them, and an elevated start shows what is in the active slot.
+        let stranded = self.stranded.iter().map(|(n, e)| (n, self.monitors.get(n).map_or(0, |m| m.active), e));
+        for (name, i, e) in recorded.chain(stranded).chain(extra.iter().map(|(n, i, e)| (n, *i, e))) {
             s += &format!("w {name} {i} {} {} {} {}\n", e.id, e.pid, e.iconic as u8, e.class);
         }
         s
@@ -434,7 +449,15 @@ pub enum Check {
 
 /// Rebuilds the slots from a saved layout at startup. Returns the new state (its hidden
 /// windows are to be hidden) and the windows to show, tagged for the startup write-ahead.
-pub fn adopt(layout: &Layout, boot: u64, names: &[String], check: impl Fn(&str, &Entry) -> Check) -> (State, Vec<Tagged>) {
+/// `stranded(live)`: a hidden window of an admin app this run can't show; kept aside (only
+/// for a file from this boot), before any test that would show it.
+pub fn adopt(
+    layout: &Layout,
+    boot: u64,
+    names: &[String],
+    check: impl Fn(&str, &Entry) -> Check,
+    stranded: impl Fn(&Entry) -> bool,
+) -> (State, Vec<Tagged>) {
     let mut state = State { monitor_set: sorted(names), ..Default::default() };
     let same_boot = layout.boot.is_some_and(|b| b.abs_diff(boot) <= BOOT_TOLERANCE_MS);
     let mut seen = HashSet::new();
@@ -445,6 +468,10 @@ pub fn adopt(layout: &Layout, boot: u64, names: &[String], check: impl Fn(&str, 
         }
         let live = match check(mon, e) {
             Check::Gone => continue,
+            Check::Here(live) | Check::Elsewhere(live) if same_boot && stranded(&live) => {
+                state.stranded.push((mon.clone(), live));
+                continue;
+            }
             Check::Elsewhere(live) => {
                 show.push((mon.clone(), live));
                 continue;
@@ -814,6 +841,70 @@ mod tests {
         assert_eq!(ids(&p.hide), [1], "the dead window is not re-captured from the plan");
     }
 
+    /// `adopt` with nothing stranded.
+    fn adopt_all(layout: &Layout, boot: u64, names: &[String], check: impl Fn(&str, &Entry) -> Check) -> (State, Vec<Tagged>) {
+        adopt(layout, boot, names, check, |_| false)
+    }
+
+    fn stranded_layout() -> Layout {
+        // A: active 1; w1 hidden in slot 0, w9 (admin, hidden) in the active slot, w8 (admin) on a gone monitor
+        Layout {
+            boot: Some(BOOT),
+            active: [(A.to_string(), 1)].into(),
+            windows: vec![(A.into(), 0, w(1)), (A.into(), 1, w(9)), ("GONE".into(), 2, w(8))],
+        }
+    }
+    fn admin(e: &Entry) -> bool {
+        e.id >= 8
+    }
+
+    #[test]
+    fn stranded_windows_are_kept_aside_wherever_they_were() {
+        let (s, show) = adopt(&stranded_layout(), BOOT, &names(), here, admin);
+        assert_eq!(ids(&s.stranded()), [9, 8], "neither the active slot nor a gone monitor shows them");
+        assert!(show.is_empty());
+        assert_eq!(ids(&s.hidden()), [1], "stranded windows are not hidden or shown by this run");
+    }
+
+    #[test]
+    fn nothing_is_stranded_from_another_boot() {
+        let (s, show) = adopt(&stranded_layout(), BOOT + 60_000, &names(), here, admin);
+        assert!(s.stranded().is_empty());
+        assert_eq!(show.len(), 3, "everything from an earlier boot is shown");
+    }
+
+    #[test]
+    fn stranded_windows_survive_restore_all_and_a_monitor_change() {
+        let (mut s, _) = adopt(&stranded_layout(), BOOT, &names(), here, admin);
+        assert_eq!(ids(&s.restore_all()), [1], "Restore all shows what it can");
+        s.reset_if_monitors_changed(&[A.to_string()]);
+        let (layout, bad) = parse(&s.serialize(BOOT, &[]));
+        assert!(bad.is_empty());
+        let (again, _) = adopt(&layout, BOOT, &names(), here, admin);
+        assert_eq!(ids(&again.stranded()), [9, 8]);
+    }
+
+    #[test]
+    fn an_elevated_start_shows_stranded_windows() {
+        let (s, _) = adopt(&stranded_layout(), BOOT, &names(), here, admin);
+        let (layout, _) = parse(&s.serialize(BOOT, &[]));
+        let (elevated, show) = adopt(&layout, BOOT, &names(), here, |_| false);
+        assert!(elevated.stranded().is_empty());
+        let mut shown: Vec<u64> = show.iter().map(|(_, _, e)| e.id).collect();
+        shown.sort();
+        assert_eq!(shown, [8, 9], "written in the active slot, so shown; the gone monitor's too");
+        assert_eq!(ids(&elevated.hidden()), [1]);
+    }
+
+    #[test]
+    fn a_stranded_window_its_app_showed_again_is_captured_once() {
+        let (mut s, _) = adopt(&stranded_layout(), BOOT, &names(), here, admin);
+        s.switch_to(A, Target::Slot(0), vec![w(9)], LATER).unwrap();
+        assert!(!ids(&s.stranded()).contains(&9));
+        let text = s.serialize(BOOT, &[]);
+        assert_eq!(text.lines().filter(|l| l.split(' ').nth(3) == Some("9")).count(), 1, "listed once");
+    }
+
     #[test]
     fn limit_of_eight() {
         let mut s = State::default();
@@ -991,7 +1082,7 @@ mod tests {
     fn adopt_restores_the_layout() {
         let s = sample();
         let (layout, _) = parse(&s.serialize(BOOT, &[]));
-        let (t, show) = adopt(&layout, BOOT + 5_000, &names(), here);
+        let (t, show) = adopt(&layout, BOOT + 5_000, &names(), here, |_| false);
         assert!(show.is_empty());
         assert_eq!(t.slots(A), s.slots(A));
         assert_eq!(t.slots(B), s.slots(B));
@@ -1003,7 +1094,7 @@ mod tests {
     #[test]
     fn adopt_skips_closed_and_shows_moved() {
         let (layout, _) = parse(&sample().serialize(BOOT, &[]));
-        let (t, show) = adopt(&layout, BOOT, &names(), |_, e| match e.id {
+        let (t, show) = adopt_all(&layout, BOOT, &names(), |_, e| match e.id {
             1 => Check::Gone,
             2 => Check::Elsewhere(e.clone()),
             _ => Check::Here(e.clone()),
@@ -1027,7 +1118,7 @@ mod tests {
                 (a.clone(), 2, w(4)),               // duplicate: first wins
             ],
         };
-        let (t, show) = adopt(&layout, BOOT, std::slice::from_ref(&a), here);
+        let (t, show) = adopt(&layout, BOOT, std::slice::from_ref(&a), here, |_| false);
         assert_eq!(t.slots(A), (1, vec![vec![w(4)], vec![]]));
         assert_eq!(show, vec![(a.clone(), 1, w(1)), (a, 1, w(2)), (B.to_string(), 0, w(3))]);
     }
@@ -1035,11 +1126,11 @@ mod tests {
     #[test]
     fn adopt_nothing_after_a_reboot_or_from_v1() {
         let (layout, _) = parse(&sample().serialize(BOOT, &[]));
-        let (t, show) = adopt(&layout, BOOT + 60_000, &names(), here);
+        let (t, show) = adopt(&layout, BOOT + 60_000, &names(), here, |_| false);
         assert!(t.hidden().is_empty());
         assert_eq!(show.len(), 3);
         let (layout, _) = parse("v1\n1 10 0 C1\n");
-        let (t, show) = adopt(&layout, BOOT, &names(), here);
+        let (t, show) = adopt(&layout, BOOT, &names(), here, |_| false);
         assert!(t.hidden().is_empty());
         assert_eq!(show.len(), 1);
     }
@@ -1051,11 +1142,11 @@ mod tests {
         let mut layout = parse(&sample().serialize(BOOT, &[])).0;
         layout.windows.push((r"\\.\GONE".to_string(), 3, w(7))); // from an unplugged monitor
         let check = |m: &str, e: &Entry| if m.contains("GONE") { Check::Elsewhere(e.clone()) } else { Check::Here(e.clone()) };
-        let (t, show) = adopt(&layout, BOOT, &names(), check);
+        let (t, show) = adopt(&layout, BOOT, &names(), check, |_| false);
         assert_eq!(show, vec![(r"\\.\GONE".to_string(), 0, w(7))]);
         let (layout2, bad) = parse(&t.serialize(BOOT, &show));
         assert!(bad.is_empty());
-        let (t2, show2) = adopt(&layout2, BOOT, &names(), check);
+        let (t2, show2) = adopt(&layout2, BOOT, &names(), check, |_| false);
         assert_eq!((t2.slots(A), t2.slots(B)), (t.slots(A), t.slots(B)));
         assert_eq!(show2, show);
     }
@@ -1149,7 +1240,7 @@ mod tests {
             if step % 250 == 0 {
                 let (layout, bad) = parse(&s.serialize(BOOT, &[]));
                 assert!(bad.is_empty());
-                let (t, show) = adopt(&layout, BOOT, &names(), here);
+                let (t, show) = adopt(&layout, BOOT, &names(), here, |_| false);
                 assert!(show.is_empty());
                 for m in mons {
                     assert_eq!(t.slots(m), s.slots(m));

@@ -17,7 +17,11 @@ use windows::Win32::Graphics::Gdi::{
     MONITOR_DEFAULTTONULL, MONITOR_DEFAULTTOPRIMARY, MONITOR_FROM_FLAGS, MONITORINFO,
     MONITORINFOEXW, MonitorFromPoint, MonitorFromRect, MonitorFromWindow,
 };
-use windows::Win32::System::Threading::GetCurrentProcessId;
+use windows::Win32::Security::{
+    GetSidSubAuthority, GetSidSubAuthorityCount, GetTokenInformation, TOKEN_ELEVATION, TOKEN_ELEVATION_TYPE, TOKEN_MANDATORY_LABEL, TOKEN_QUERY,
+    TokenElevation, TokenElevationType, TokenElevationTypeFull, TokenElevationTypeLimited, TokenIntegrityLevel,
+};
+use windows::Win32::System::Threading::{GetCurrentProcess, GetCurrentProcessId, OpenProcess, OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION};
 use windows::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     INPUT, INPUT_0, INPUT_KEYBOARD, KEYBD_EVENT_FLAGS, KEYBDINPUT, KEYEVENTF_KEYUP, SendInput, VIRTUAL_KEY,
@@ -203,6 +207,70 @@ pub fn icon_of(id: u64) -> HICON {
         .unwrap_or_default();
     ICONS.with(|i| i.borrow_mut().insert(id, icon));
     icon
+}
+
+// ---------- elevation ----------
+
+const MEDIUM: u32 = 0x2000;
+const HIGH: u32 = 0x3000;
+
+/// (elevated, elevation type, integrity level) of a process's token; None if unreadable.
+fn token_facts(process: windows::Win32::Foundation::HANDLE) -> Option<(bool, TOKEN_ELEVATION_TYPE, u32)> {
+    unsafe {
+        let mut token = windows::Win32::Foundation::HANDLE::default();
+        OpenProcessToken(process, TOKEN_QUERY, &mut token).ok()?;
+        let mut len = 0u32;
+        let mut elevation = TOKEN_ELEVATION::default();
+        let mut kind = TOKEN_ELEVATION_TYPE(0);
+        let mut label = [0u8; 128];
+        let ok = GetTokenInformation(token, TokenElevation, Some(&mut elevation as *mut _ as *mut c_void), size_of::<TOKEN_ELEVATION>() as u32, &mut len).is_ok()
+            && GetTokenInformation(token, TokenElevationType, Some(&mut kind as *mut _ as *mut c_void), size_of::<TOKEN_ELEVATION_TYPE>() as u32, &mut len).is_ok()
+            && GetTokenInformation(token, TokenIntegrityLevel, Some(label.as_mut_ptr() as *mut c_void), label.len() as u32, &mut len).is_ok();
+        let _ = windows::Win32::Foundation::CloseHandle(token);
+        if !ok {
+            return None;
+        }
+        let sid = (*(label.as_ptr() as *const TOKEN_MANDATORY_LABEL)).Label.Sid;
+        let n = *GetSidSubAuthorityCount(sid);
+        Some((elevation.TokenIsElevated != 0, kind, *GetSidSubAuthority(sid, n.saturating_sub(1) as u32)))
+    }
+}
+
+fn own_token() -> Option<(bool, TOKEN_ELEVATION_TYPE, u32)> {
+    static OWN: OnceLock<Option<(bool, TOKEN_ELEVATION_TYPE, u32)>> = OnceLock::new();
+    *OWN.get_or_init(|| token_facts(unsafe { GetCurrentProcess() }))
+}
+
+/// This process runs as administrator.
+pub fn is_elevated() -> bool {
+    own_token().is_some_and(|(e, _, _)| e)
+}
+
+/// The user is an administrator who elevates as themselves (Admin Approval Mode): only then is
+/// an elevated copy the same user, with the same state folder. A standard user (or UAC off)
+/// reads as `TokenElevationTypeDefault`.
+pub fn elevates_as_self() -> bool {
+    own_token().is_some_and(|(_, kind, _)| kind == TokenElevationTypeLimited || kind == TokenElevationTypeFull)
+}
+
+/// The integrity level of a window's process (None if it can't be read).
+fn integrity_of(h: HWND) -> Option<u32> {
+    unsafe {
+        let p = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid_of(h)).ok()?;
+        let facts = token_facts(p);
+        let _ = windows::Win32::Foundation::CloseHandle(p);
+        facts.map(|(_, _, level)| level)
+    }
+}
+
+/// A saved window this run can neither show nor hide: hidden, belonging to an app running as
+/// administrator (exactly High) while this run isn't (Medium). Elevation can't help with
+/// SYSTEM or protected windows, so those don't count; an unreadable token doesn't either.
+pub fn stranded(e: &Entry) -> bool {
+    let h = hwnd(e.id);
+    own_token().is_some_and(|(_, _, level)| level == MEDIUM)
+        && !unsafe { IsWindowVisible(h).as_bool() }
+        && integrity_of(h) == Some(HIGH)
 }
 
 /// The very window the entry recorded, still there (a destroyed handle may be reused).
@@ -584,11 +652,6 @@ pub fn write_state(state: &State, extra: &[Tagged]) {
     if let Err(e) = result {
         log!("state file write failed: {e}");
     }
-}
-
-/// Forget the saved layout (Restore all, monitor set changed).
-pub fn clear_state() {
-    write_state(&State::default(), &[]);
 }
 
 pub fn read_layout() -> Layout {
