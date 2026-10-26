@@ -11,7 +11,7 @@
 
 ## 2. Core: stranded entries
 
-- [ ] 2.1 `core.rs`: a stranded list beside the slots; `adopt` takes a `stranded` predicate and applies it after `check` (Here and Elsewhere), before the active-slot/limit/monitor tests, only for the current boot; `serialize`, `restore_all` and `reset_if_monitors_changed` keep the list; `forget_dead` leaves it alone; an elevated run's adopt takes them back as ordinary entries; serialized tagged with the monitor's active slot; `hidden()` excludes them; a switch or move that captures one drops it from the list; tests: active slot, gone monitor, other boot, Restore all round trip, stranded → serialize → parse → adopt with the predicate false → shown
+- [ ] 2.1 `core.rs`: a stranded list beside the slots; `adopt` takes a `stranded` predicate, called with the live entry from `check` and ANDed with `same_boot` in core, applied after `check` (Here and Elsewhere), before the active-slot/limit/monitor tests, only for the current boot; `serialize`, `restore_all` and `reset_if_monitors_changed` keep the list; `forget_dead` leaves it alone; an elevated run's adopt takes them back as ordinary entries; serialized tagged with the monitor's active slot; `hidden()` excludes them; a switch or move that captures one drops it from the list; tests: active slot, gone monitor, other boot, Restore all round trip, stranded → serialize → parse → adopt with the predicate false → shown
 - [ ] 2.2 `main.rs`: Restore all and the monitor-set reset call `persist(&[])` instead of `win::clear_state()`; remove `clear_state`
 
 ## 2b. Elevation in the app
