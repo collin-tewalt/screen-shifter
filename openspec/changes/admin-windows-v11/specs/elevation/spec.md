@@ -16,7 +16,11 @@ When the app is not elevated, its build can elevate, and the user is an administ
 - **THEN** the tray tooltip says it is running as administrator and "Run as administrator" isn't offered
 
 ### Requirement: Always run as administrator
-The tray menu SHALL offer "Always run as administrator", remembered across runs, under the same conditions as "Run as administrator". When it is on and the app starts unelevated (including at sign-in), it SHALL ask through UAC once, after its own start, to restart elevated; declining SHALL keep it running unelevated for that session without asking again.
+The tray menu SHALL offer "Always run as administrator", remembered across runs, to an administrator whose build can elevate, whether or not the app is elevated right now (so it can be turned off while elevated). When it is on and the app starts unelevated (including at sign-in), it SHALL ask through UAC once, after its own start, to restart elevated; declining SHALL keep it running unelevated for that session without asking again.
+
+#### Scenario: Turn it off while elevated
+- **WHEN** the app runs elevated and the user unchecks "Always run as administrator"
+- **THEN** the next start doesn't ask to elevate
 
 #### Scenario: Sign-in
 - **WHEN** "Always run as administrator" is on and the app starts at sign-in
@@ -36,9 +40,13 @@ When an unelevated start finds windows of apps running as administrator that an 
 - **WHEN** an unelevated run switched away from a slot while an admin terminal stayed on screen, and the app starts again
 - **THEN** nothing is asked
 
-#### Scenario: After a crash while elevated
-- **WHEN** the elevated app hid an admin terminal, the PC lost power, and the app starts unelevated at sign-in
-- **THEN** it asks to run as administrator; on Yes the terminal comes back into its slot
+#### Scenario: After the elevated app was ended
+- **WHEN** the elevated app hid an admin terminal, was then ended from Task Manager, and the user starts it again unelevated
+- **THEN** it asks to run as administrator; on Yes the terminal comes back
+
+#### Scenario: Restore all keeps them
+- **WHEN** admin windows are stranded and the user chooses Restore all in the unelevated app
+- **THEN** the normal windows are shown and the stranded ones stay recorded, so the question comes again at the next start
 
 ### Requirement: Only for administrators
 The administrator items, the "always" relaunch and the stranded question SHALL be offered only to a user who is an administrator approving elevation as themselves.
