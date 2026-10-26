@@ -191,7 +191,8 @@ fn child(route: &str) {
 
 static TASKBAR_CREATED: AtomicU32 = AtomicU32::new(0);
 static FILTERED: std::sync::Mutex<isize> = std::sync::Mutex::new(0);
-static SEEN_TRAY: [AtomicBool; 2] = [AtomicBool::new(false), AtomicBool::new(false)];
+static CLICKS: [AtomicU32; 2] = [AtomicU32::new(0), AtomicU32::new(0)];
+static RESTARTED: AtomicBool = AtomicBool::new(false);
 
 fn which(h: HWND) -> usize {
     if h.0 as isize == *FILTERED.lock().unwrap() { 0 } else { 1 }
@@ -218,6 +219,7 @@ fn tray(h: HWND, op: NOTIFY_ICON_MESSAGE) {
 unsafe extern "system" fn admin_proc(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     let name = ["filtered", "unfiltered"][which(h)];
     if msg != 0 && msg == TASKBAR_CREATED.load(SeqCst) {
+        RESTARTED.store(true, SeqCst);
         log(&format!("ADMIN [1.7]: TaskbarCreated RECEIVED by the {name} window; re-adding its tray icon"));
         tray(h, NIM_ADD);
         return LRESULT(0);
@@ -225,8 +227,10 @@ unsafe extern "system" fn admin_proc(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
     match msg {
         WM_TRAYCB => {
             let ev = lp.0 as u32;
-            if matches!(ev, WM_LBUTTONUP | WM_RBUTTONUP | WM_CONTEXTMENU) && !SEEN_TRAY[which(h)].swap(true, SeqCst) {
-                log(&format!("ADMIN [1.7]: tray click RECEIVED by the {name} icon"));
+            if matches!(ev, WM_LBUTTONUP | WM_RBUTTONUP) {
+                let n = CLICKS[which(h)].fetch_add(1, SeqCst) + 1;
+                let when = if RESTARTED.load(SeqCst) { "AFTER the Explorer restart" } else { "before any Explorer restart" };
+                log(&format!("ADMIN [1.7]: tray click #{n} RECEIVED by the {name} icon, {when}"));
             }
             LRESULT(0)
         }
@@ -266,9 +270,7 @@ fn admin() {
         }
         tray(filtered, NIM_DELETE);
         tray(unfiltered, NIM_DELETE);
-        if !SEEN_TRAY[0].load(SeqCst) && !SEEN_TRAY[1].load(SeqCst) {
-            log("ADMIN [1.7]: no tray clicks were received by either icon");
-        }
+        log(&format!("ADMIN [1.7]: tray clicks in total: filtered {}, unfiltered {}", CLICKS[0].load(SeqCst), CLICKS[1].load(SeqCst)));
     }
     log("ADMIN exits");
 }
@@ -347,11 +349,14 @@ fn medium() {
     log(&format!("  probe written at {}", probe_path().display()));
 
     // 1.2 / 1.3 / 1.4: three ways of relaunching elevated
-    let routes = [
+    let nocap = pfn.contains("NoCap");
+    log(&format!("  this package {} the allowElevation capability", if nocap { "does NOT declare" } else { "declares" }));
+    let all = [
         ("exe-path", exe.clone()),
         ("alias", "ss-spike.exe".to_string()),
         ("appsfolder", format!("shell:AppsFolder\\{pfn}!Spike")),
     ];
+    let routes: Vec<(&str, String)> = if nocap { vec![all[0].clone()] } else { all.to_vec() };
     for (route, file) in &routes {
         pause(&format!("Route '{route}': a UAC prompt will appear. Approve it (Yes)."));
         if let Some(h) = runas(route, file, &format!("--child {route}")) {
@@ -371,7 +376,8 @@ fn medium() {
         .iter()
         .find(|(r, _)| results.lines().any(|l| l.contains(&format!("CHILD route={r} ")) && !l.contains("identity=NONE")))
         .or(routes.first())
-        .unwrap();
+        .unwrap()
+        .clone();
     log(&format!("Using route '{}' for the elevated test copy", good.0));
     pause("The elevated test copy: another UAC prompt. Approve it.");
     let Some(h) = runas(&format!("{} (test copy)", good.0), &good.1, "--admin") else {
@@ -418,13 +424,22 @@ fn medium() {
     // 1.1: the hooks while an elevated window has focus
     let hook = unsafe { SetWindowsHookExW(WH_KEYBOARD_LL, Some(kbd), None, 0) };
     log(&format!("  keyboard hook installed: {}", hook.is_ok()));
-    pause("Next: within 15 seconds, CLICK one of the 'Spike admin window' windows and press and release Ctrl+Alt a few times. Then click back here.");
+    pause("Hook control: after Enter, stay in THIS console window and press and release Ctrl+Alt a few times (10 seconds).");
+    KEYS_ON_ADMIN.store(0, SeqCst);
+    KEYS_ELSEWHERE.store(0, SeqCst);
+    println!("    ...10 seconds, press Ctrl+Alt here");
+    pump_for(Duration::from_secs(10));
+    log(&format!(
+        "HOOKS [1.1] control: Ctrl/Alt events seen while a NORMAL window had focus: {} (must be > 0 for the next line to mean anything)",
+        KEYS_ELSEWHERE.load(SeqCst)
+    ));
+    pause("Hook test: after Enter, within 15 seconds CLICK one of the 'Spike admin window' windows and press and release Ctrl+Alt a few times. Then click back here.");
     KEYS_ON_ADMIN.store(0, SeqCst);
     KEYS_ELSEWHERE.store(0, SeqCst);
     println!("    ...15 seconds, go");
     pump_for(Duration::from_secs(15));
     log(&format!(
-        "HOOKS [1.1]: Ctrl/Alt events seen by the unelevated hook while the elevated window had focus: {}; elsewhere: {}",
+        "HOOKS [1.1]: Ctrl/Alt events seen while the ELEVATED window had focus: {}; elsewhere: {}",
         KEYS_ON_ADMIN.load(SeqCst),
         KEYS_ELSEWHERE.load(SeqCst)
     ));
@@ -433,7 +448,7 @@ fn medium() {
     }
 
     // 1.7: tray while elevated
-    pause("Tray test [1.7]: click the two new tray icons (an 'i' and a '!'; maybe under the ^ arrow). Then, if you're willing, restart Explorer (Task Manager > Windows Explorer > Restart), wait for the taskbar, and click whichever icons came back. Skip anything you'd rather not do.");
+    pause("Tray test [1.7]: click each of the two new tray icons (an 'i' and a '!'; maybe under the ^ arrow) once. Then restart Explorer (Task Manager > Windows Explorer > Restart), wait for the taskbar, and click each icon that came back once more. Every click is logged now.");
     pause("Finally: close one of the 'Spike admin window' windows (that ends the elevated test copy).");
     unsafe {
         WaitForSingleObject(h, 60_000);
