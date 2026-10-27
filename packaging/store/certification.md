@@ -2,7 +2,7 @@
 
 ## Restricted capability justification (Submission options → runFullTrust)
 
-Screen Shifter is a Win32 desktop tray application (packaged with the Desktop Bridge). It needs full trust to do its job: it shows and hides other applications' top-level windows (ShowWindow), moves them between monitors (SetWindowPlacement), watches its own keyboard and mouse shortcuts with low-level hooks, reads the screen with Desktop Duplication for its animations and previews, and uses a startup task. None of this is possible from an app container.
+Screen Shifter is a Win32 desktop tray application (packaged with the Desktop Bridge). It needs full trust to do its job: it shows and hides other applications' top-level windows (ShowWindow), moves them between monitors (SetWindowPlacement), watches its own keyboard and mouse shortcuts with low-level hooks, reads the screen with Desktop Duplication for its animations and previews, uses a startup task, and, only when the user asks to run as administrator, relaunches itself through UAC (ShellExecuteExW with "runas") to manage windows of elevated apps. None of this is possible from an app container.
 
 ## Notes for certification (Submission options → Notes for testers)
 
