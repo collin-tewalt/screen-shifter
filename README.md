@@ -2,6 +2,14 @@
 
 Per-monitor "desktops" for Windows: each monitor gets its own row of slots of windows that you switch independently, like macOS's "Displays have separate Spaces".
 
+## Install
+
+From the [Microsoft Store](https://apps.microsoft.com/detail/9MVJDZ8V91SK), or:
+
+```
+winget install 9MVJDZ8V91SK
+```
+
 ## Use
 
 Hold **`Ctrl+Alt`** to bring up a panel on every monitor showing what's in each slot. While holding it:
