@@ -32,5 +32,5 @@
 
 - [x] 4.1 `cargo test` and `cargo clippy --all-targets -- -D warnings` clean
 - [x] 4.2 README (tray menu, admin windows, stranded case), PRIVACY.md (elevation only on request), AGENTS.md, ROADMAP.md (Now)
-- [ ] 4.3 Owner manual test: run as admin (approve and decline), admin terminal in a slot, Exit while elevated shows it, "always" at sign-in, a second launch while elevated, stranded case (the owner ends the elevated app from Task Manager with only their own test admin window hidden), an admin window that stayed visible asks nothing, Explorer restart while elevated keeps the tray, declining the "always" prompt at sign-in asks nothing more that session, a standard user sees no items
+- [x] 4.3 Owner manual test: run as admin (approve and decline), admin terminal in a slot, Exit while elevated shows it, "always" at sign-in, a second launch while elevated, stranded case (the owner ends the elevated app from Task Manager with only their own test admin window hidden), an admin window that stayed visible asks nothing, Explorer restart while elevated keeps the tray, declining the "always" prompt at sign-in asks nothing more that session, a standard user sees no items
 - [ ] 4.4 Certification kit on the Store build; submit with the certification note
